@@ -14,7 +14,8 @@
     "build:web": "pnpm --filter @exit-liquidity/web build",
     "server": "pnpm --filter @exit-liquidity/server start",
     "verify": "pnpm --filter @exit-liquidity/server verify",
-    "parity": "node scripts/web-parity.mjs"
+    "parity": "node scripts/web-parity.mjs",
+    "m1:exit": "pnpm --filter @exit-liquidity/server exit-test"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

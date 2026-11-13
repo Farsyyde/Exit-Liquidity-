@@ -9,7 +9,8 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "verify": "tsx src/verify-cli.ts",
-    "bots": "tsx src/bots-cli.ts"
+    "bots": "tsx src/bots-cli.ts",
+    "exit-test": "tsx src/exit-cli.ts"
   },
   "dependencies": {
     "@exit-liquidity/engine": "workspace:*",
