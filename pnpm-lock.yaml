@@ -62,9 +62,25 @@ importers:
         specifier: ^5.4.11
         version: 5.4.21(@types/node@22.10.0)
 
+  contracts:
+    dependencies:
+      '@erc8426/contracts':
+        specifier: 0.3.0
+        version: 0.3.0
+      '@noble/hashes':
+        specifier: 1.6.1
+        version: 1.6.1
+      '@openzeppelin/contracts':
+        specifier: 5.1.0
+        version: 5.1.0
+
   packages/engine: {}
 
 packages:
+
+  '@erc8426/contracts@0.3.0':
+    resolution: {integrity: sha512-tn+c3CrGuaa2BMQQQyOeXn57/ghAYgGVtnvqL5NIqtNv6LZdq/b53K0AR7CA6Cjzuyw/6LwReK0uCq2+yBxt6g==}
+    engines: {node: '>=22'}
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -504,6 +520,9 @@ packages:
   '@noble/hashes@1.6.1':
     resolution: {integrity: sha512-pq5D8h10hHBjyqX+cfBm0i8JUXJ0UhczFc4r74zbuT9XgewFo2E3J1cOaGtdZynILNmQ685YWGzGE1Zv6io50w==}
     engines: {node: ^14.21.3 || >=16}
+
+  '@openzeppelin/contracts@5.1.0':
+    resolution: {integrity: sha512-p1ULhl7BXzjjbha5aqst+QMLY+4/LCWADXOCsmLHRM77AqiPjnd9vvUN9sosUfhL9JGKpZ0TjEGxgvnizmWGSA==}
 
   '@rollup/rollup-android-arm-eabi@4.68.2':
     resolution: {integrity: sha512-ItKrNMkEL3hy85kLBXwB0+M6CWWVI8vr7RV+Eb7oDlQIMXLaiEhGfdaj5jAUadYn2v3nwzAhIRl/nLyjAqV9vQ==}
@@ -1030,6 +1049,10 @@ packages:
 
 snapshots:
 
+  '@erc8426/contracts@0.3.0':
+    dependencies:
+      '@openzeppelin/contracts': 5.1.0
+
   '@esbuild/aix-ppc64@0.21.5':
     optional: true
 
@@ -1250,6 +1273,8 @@ snapshots:
   '@jridgewell/sourcemap-codec@1.6.0': {}
 
   '@noble/hashes@1.6.1': {}
+
+  '@openzeppelin/contracts@5.1.0': {}
 
   '@rollup/rollup-android-arm-eabi@4.68.2':
     optional: true
