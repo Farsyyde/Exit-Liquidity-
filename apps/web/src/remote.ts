@@ -1,6 +1,6 @@
 import {
   MAX_CANDLES, PROTOCOL_VERSION,
-  type Button, type ClientMsg, type EngineEvent, type ServerMsg, type View, type RankedReceipt, type Attestation,
+  type Button, type ClientMsg, type PublicEvent, type ServerMsg, type View, type RankedReceipt, type Attestation,
 } from '@exit-liquidity/engine';
 import type { Driver } from './driver.ts';
 
@@ -29,30 +29,44 @@ export async function fetchLeaderboard(): Promise<{ day: string; rows: { name: s
   return r.json();
 }
 
+export type LinkStatus = 'ok' | 'reconnecting' | 'lost' | 'replaced';
+
+const RETRY_MS = [250, 500, 1000, 2000, 3000, 5000];
+const GIVE_UP_MS = 3 * 60_000;
+
+function wsUrl(): string {
+  return (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
+}
+
 /**
  * Ranked mode. The server owns the seed and the clock. This driver only
- * renders what arrives and forwards button presses.
+ * renders what arrives and forwards button presses. If the connection drops,
+ * the run carries on at the server; this driver reconnects with resume and
+ * picks up from the server's full snapshot.
  */
 export class RemoteDriver implements Driver {
   readonly kind = 'ranked' as const;
   view: View | null = null;
-  onEvents: (ev: EngineEvent[]) => void = () => {};
+  onEvents: (ev: PublicEvent[]) => void = () => {};
   onChange: () => void = () => {};
+  onStatus: (s: LinkStatus) => void = () => {};
   identity: Identity = { name: '', token: '' };
   private final: { receipt: RankedReceipt; attestation: Attestation } | null = null;
+  private closedByUs = false;
+  private retry = 0;
+  private lostAt = 0;
 
   private constructor(private ws: WebSocket) {}
 
   static connect(name: string): Promise<RemoteDriver> {
     return new Promise((resolve, reject) => {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(proto + '//' + location.host + '/ws');
+      const ws = new WebSocket(wsUrl());
       const d = new RemoteDriver(ws);
       const prev = loadIdentity();
       let settled = false;
       ws.onopen = () => d.send({ t: 'hello', v: PROTOCOL_VERSION, name, token: prev && prev.name === name ? prev.token : undefined });
       ws.onerror = () => { if (!settled) { settled = true; reject(new Error('Could not reach the run server.')) } };
-      ws.onclose = () => { if (!settled) { settled = true; reject(new Error('The run server closed the connection.')) } };
+      ws.onclose = () => { if (!settled) { settled = true; reject(new Error('The run server closed the connection.')) } else d.dropped() };
       ws.onmessage = (e) => {
         const m = JSON.parse(String(e.data)) as ServerMsg;
         if (!settled) {
@@ -65,10 +79,36 @@ export class RemoteDriver implements Driver {
     });
   }
 
+  /** The socket closed without us asking. The run is still going at the server, so go back to it. */
+  private dropped(): void {
+    if (this.closedByUs || this.final) return;
+    if (!this.lostAt) this.lostAt = Date.now();
+    if (Date.now() - this.lostAt > GIVE_UP_MS) { this.onStatus('lost'); return }
+    this.onStatus('reconnecting');
+    const wait = RETRY_MS[Math.min(this.retry++, RETRY_MS.length - 1)]!;
+    setTimeout(() => this.reopen(), wait);
+  }
+
+  private reopen(): void {
+    if (this.closedByUs) return;
+    const ws = new WebSocket(wsUrl());
+    this.ws = ws;
+    ws.onopen = () => this.send({ t: 'hello', v: PROTOCOL_VERSION, name: this.identity.name, token: this.identity.token, resume: true });
+    ws.onclose = () => { if (this.ws === ws) this.dropped() };
+    ws.onerror = () => { /* close follows */ };
+    ws.onmessage = (e) => this.handle(JSON.parse(String(e.data)) as ServerMsg);
+  }
+
   private send(m: ClientMsg): void { if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(m)) }
 
   private handle(m: ServerMsg): void {
-    if (m.t === 'snap') {
+    if (m.t === 'welcome') {
+      if (m.resumed) { this.retry = 0; this.lostAt = 0; this.onStatus('ok') }
+    } else if (m.t === 'error') {
+      if (m.code === 'replaced') { this.closedByUs = true; this.onStatus('replaced') }
+      else if (m.code === 'resume') { this.closedByUs = true; this.onStatus('lost') }
+    } else if (m.t === 'snap') {
+      // a snapshot is the whole truth, chart history included: after a resume it replaces everything
       this.view = m.v;
       if (m.ev.length) this.onEvents(m.ev);
       this.onChange();
@@ -93,5 +133,5 @@ export class RemoteDriver implements Driver {
     for (let k = 0; k < 50 && !this.final; k++) await new Promise((r) => setTimeout(r, 100));
     return JSON.stringify(this.final ?? { error: 'receipt not received' });
   }
-  close(): void { try { this.ws.close() } catch { /* already closed */ } }
+  close(): void { this.closedByUs = true; try { this.ws.close() } catch { /* already closed */ } }
 }

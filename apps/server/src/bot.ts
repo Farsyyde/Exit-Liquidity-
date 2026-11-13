@@ -2,9 +2,10 @@
 // so the server's stamping is exercised with real network timing.
 
 import WebSocket from 'ws';
+import { headlineType } from './headlines.ts';
 import {
   CON, IND, PROTOCOL_VERSION, mulberry32,
-  type Attestation, type Button, type ClientMsg, type RankedReceipt, type ServerMsg, type View, type EngineEvent,
+  type Attestation, type Button, type ClientMsg, type RankedReceipt, type ServerMsg, type View, type PublicEvent,
 } from '@exit-liquidity/engine';
 
 export interface BotOptions {
@@ -12,8 +13,10 @@ export interface BotOptions {
   name: string;
   token?: string;
   seed: number;         // bot's own randomness, not the game seed
-  /** Probability of walking away mid run (the server must finish the run unattended). */
+  /** Probability of walking away mid run for good (the run plays on without input). */
   quitChance?: number;
+  /** Probability of dropping the connection mid run and resuming it. */
+  reconnectChance?: number;
   /** Client side message budget per second, under the server's limit. */
   maxPerSec?: number;
   timeoutMs?: number;
@@ -21,10 +24,15 @@ export interface BotOptions {
 
 export interface BotResult {
   token: string | null;
+  player: number | null;
   run: number | null;
   receipt: RankedReceipt | null;
   attestation: Attestation | null;
   quit: boolean;
+  /** Times this bot dropped and resumed. */
+  reconnects: number;
+  /** For each resume: run ticks that passed while away (the server clock must not pause). */
+  awayTicks: number[];
   error: string | null;
   sent: number;
 }
@@ -33,15 +41,18 @@ const BUTTONS: Button[] = ['buy', 'sell', 'lock', 'item0', 'item1'];
 
 export function playBot(o: BotOptions): Promise<BotResult> {
   const R = mulberry32(o.seed);
-  const res: BotResult = { token: null, run: null, receipt: null, attestation: null, quit: false, error: null, sent: 0 };
+  const res: BotResult = { token: null, player: null, run: null, receipt: null, attestation: null, quit: false, reconnects: 0, awayTicks: [], error: null, sent: 0 };
   const budget = o.maxPerSec ?? 30;
   const quitAt = R() < (o.quitChance ?? 0) ? 20 + Math.floor(R() * 600) : -1;
+  const dropAt = quitAt < 0 && R() < (o.reconnectChance ?? 0) ? 20 + Math.floor(R() * 600) : -1;
   return new Promise((resolve) => {
-    const ws = new WebSocket(o.url);
+    let ws: WebSocket;
+    let finished = false, dropping = false;
+    let lastK = -1, lastLayer = -1, dropK = -1, dropLayer = -1;
     let view: View | null = null;
     let shopDoneFor = -1, ticks = 0, sentWindow = 0, windowStart = Date.now();
     let pos: { dir: 1 | -1; ret: number } | null = null, ready = false;
-    const done = () => { clearTimeout(timer); try { ws.close() } catch { /* closed */ } resolve(res) };
+    const done = () => { if (finished) return; finished = true; clearTimeout(timer); try { ws.close() } catch { /* closed */ } resolve(res) };
     const timer = setTimeout(() => { res.error = 'timeout'; done() }, o.timeoutMs ?? 120_000);
     const send = (m: ClientMsg, force = false): void => {
       const t = Date.now();
@@ -54,18 +65,26 @@ export function playBot(o: BotOptions): Promise<BotResult> {
 
     // Headline trader: buy pump headlines, get out on dump headlines or after the move.
     let heldFor = 0;
-    function onHeadlines(ev: EngineEvent[]): void {
+    function onHeadlines(ev: PublicEvent[]): void {
       for (const e of ev) {
         if (e.k !== 'headline' || e.mine) continue;
-        if (e.type === 'pump' && !pos && R() < 0.9) send({ t: 'press', b: 'buy' });
-        else if ((e.type === 'dump' || e.type === 'rug') && pos) send({ t: 'press', b: pos.dir === 1 ? 'sell' : 'buy' });
-        else if ((e.type === 'dump' || e.type === 'rug') && !pos && R() < 0.7) send({ t: 'press', b: 'sell' });
+        const type = headlineType(e.text);
+        if (type === 'pump' && !pos && R() < 0.9) send({ t: 'press', b: 'buy' });
+        else if ((type === 'dump' || type === 'rug') && pos) send({ t: 'press', b: pos.dir === 1 ? 'sell' : 'buy' });
+        else if ((type === 'dump' || type === 'rug') && !pos && R() < 0.7) send({ t: 'press', b: 'sell' });
       }
     }
 
     function onTick(): void {
       ticks++;
       if (quitAt >= 0 && ticks >= quitAt) { res.quit = true; done(); return }
+      if (dropAt >= 0 && ticks === dropAt) {
+        // drop the connection, stay away a moment, then resume the same run
+        dropping = true; dropK = lastK; dropLayer = lastLayer;
+        ws.close();
+        setTimeout(() => connect(true), 20 + Math.floor(R() * 300));
+        return;
+      }
       heldFor = pos ? heldFor + 1 : 0;
       if (pos) {
         if (heldFor > 50 + R() * 20 || pos.ret > 0.3 || pos.ret < -0.15) send({ t: 'press', b: pos.dir === 1 ? 'sell' : 'buy' });
@@ -95,19 +114,30 @@ export function playBot(o: BotOptions): Promise<BotResult> {
       send({ t: 'next' }, true);
     }
 
-    ws.on('open', () => send({ t: 'hello', v: PROTOCOL_VERSION, name: o.name, token: o.token, lite: true }, true));
+    function connect(resume: boolean): void {
+    ws = new WebSocket(o.url);
+    ws.on('open', () => send({ t: 'hello', v: PROTOCOL_VERSION, name: o.name, token: res.token ?? o.token, lite: true, resume }, true));
     ws.on('message', (data) => {
       const m = JSON.parse(String(data)) as ServerMsg;
-      if (m.t === 'welcome') { res.token = m.token; res.run = null }
+      if (m.t === 'welcome') {
+        res.token = m.token; res.player = m.player;
+        if (m.resumed) { res.reconnects++; dropping = false; resumedAwait = true }
+      }
       else if (m.t === 'error') { if (!res.receipt) res.error = m.code + ': ' + m.msg; if (m.code !== 'mint') done() }
       else if (m.t === 'snap') {
         view = m.v;
+        if (resumedAwait) {
+          resumedAwait = false;
+          // ticks elapsed on the server while we were away, measured from the run's own clock
+          if (view.i === dropLayer && view.phase === 'play') res.awayTicks.push(view.level.dur - view.left - dropK);
+        }
         pos = view.pos ? { dir: view.pos.dir, ret: view.pos.ret } : null;
         ready = view.ready;
         if (view.phase === 'intro') send({ t: 'go' }, true);
         else if (view.phase === 'shop') onShop(view);
         onHeadlines(m.ev);
       } else if (m.t === 'tick') {
+        lastK = m.k; lastLayer = 's' in m ? m.s.i : m.v.i;
         if ('s' in m) { pos = m.s.pos ? { dir: m.s.pos.dir, ret: m.s.pos.ret } : null; ready = m.s.ready }
         onHeadlines(m.ev);
         onTick();
@@ -118,7 +148,10 @@ export function playBot(o: BotOptions): Promise<BotResult> {
         setTimeout(done, 20);
       } else if (m.t === 'minted') { /* fine */ }
     });
-    ws.on('error', (e) => { res.error = String(e); done() });
-    ws.on('close', () => done());
+    ws.on('error', (e) => { if (!dropping) { res.error = String(e); done() } });
+    ws.on('close', () => { if (!dropping) done() });
+    }
+    let resumedAwait = false;
+    connect(false);
   });
 }

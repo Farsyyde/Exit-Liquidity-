@@ -5,7 +5,7 @@ import {
   engine, FIXED_MATH_ID, attestationMessage, canonicalReceipt,
   type Attestation, type RankedReceipt, type RunResult,
 } from '@exit-liquidity/engine';
-import { commitOf, keccakHex, parseSeedHex, runSeedOf } from './seeds.ts';
+import { commitOf, keccakHex, parseSeedHex, runSeedOf, RANKED_RNG } from './seeds.ts';
 import { verifySig } from './sign.ts';
 
 export interface VerifyInput {
@@ -25,8 +25,9 @@ const sameResult = (a: RunResult, b: RunResult) => a.layers === b.layers && a.ba
 export function verifyRanked(x: VerifyInput): VerifyOutcome {
   const problems: string[] = [];
   const r = x.receipt;
-  if (!r || r.game !== 'exit-liquidity' || r.v !== 2) return { ok: false, problems: ['not an exit-liquidity v2 receipt'], replayed: null };
+  if (!r || r.game !== 'exit-liquidity' || r.v !== 3) return { ok: false, problems: ['not an exit-liquidity v3 receipt'], replayed: null };
   if (!r.ranked) return { ok: false, problems: ['not a ranked receipt'], replayed: null };
+  if (r.rng !== RANKED_RNG) problems.push(`ranked receipts must use ${RANKED_RNG}, got ${String(r.rng)}`);
   if (r.math !== FIXED_MATH_ID) problems.push(`ranked receipts must use ${FIXED_MATH_ID} math, got ${r.math ?? 'native'}`);
 
   let seedBytes: Uint8Array | null = null;
@@ -34,7 +35,7 @@ export function verifyRanked(x: VerifyInput): VerifyOutcome {
   if (seedBytes) {
     if (x.commit && commitOf(seedBytes).toLowerCase() !== x.commit.toLowerCase()) problems.push('daily seed does not match the commit');
     const want = runSeedOf(seedBytes, r.ranked.player, r.ranked.attempt);
-    if (want !== r.seed) problems.push(`run seed ${r.seed} is not derived from the daily seed (expected ${want})`);
+    if (want !== r.seed) problems.push(`run seed ${String(r.seed)} is not derived from the daily seed (expected ${want})`);
   }
 
   const out = engine.replay(r);

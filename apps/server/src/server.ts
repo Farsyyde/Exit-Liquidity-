@@ -26,6 +26,8 @@ export interface ServerOptions {
   mintCharges?: number;
   /** Built web client to serve, if any. */
   staticDir?: string | null;
+  /** How long a finished run's result stays available to a resuming client. */
+  resumeKeepMs?: number;
   /** Messages a connection may send per second before it is dropped. */
   maxMsgsPerSec?: number;
   /** Wall clock for UTC days and timestamps. Tick timing never uses it. */
@@ -37,7 +39,10 @@ const NAME = /^[A-Za-z0-9 _.-]{2,24}$/;
 
 export async function startServer(o: ServerOptions = {}) {
   const now = o.now ?? Date.now;
-  const log = o.log ?? ((m: string) => console.log(m));
+  // Nothing the server logs may carry a seed. Seeds are never passed to log(),
+  // and as a backstop any 32 byte hex value is redacted before it is written.
+  const rawLog = o.log ?? ((m: string) => console.log(m));
+  const log = (m: string) => rawLog(m.replace(/(0x)?[0-9a-fA-F]{64}/g, '[redacted]'));
   const tickMs = o.tickMs ?? 100;
   const cap = o.attemptsPerDay ?? 3;
   const idleMs = o.idleMs ?? 5 * 60_000;
@@ -47,7 +52,15 @@ export async function startServer(o: ServerOptions = {}) {
   const signer: Signer = loadOrCreateSigner(o.signerKeyPath ?? null);
   const voided = db.voidLiveRuns(now());
   if (voided) log(`voided ${voided} runs left live by a previous process`);
-  const live = new Set<RunSession>();
+  /** Runs in progress, by player. One per player at a time. */
+  const live = new Map<number, RunSession>();
+  /** Finished runs kept a while, so a client that dropped near the end can still get its result. */
+  const recent = new Map<number, { s: RunSession; at: number }>();
+  const keepMs = o.resumeKeepMs ?? 15 * 60_000;
+  function recentFor(player: number): RunSession | undefined {
+    for (const [p, r] of recent) if (now() - r.at > keepMs) recent.delete(p);
+    return recent.get(player)?.s;
+  }
 
   function daySeed(day: string): { seed: Uint8Array; commit: string } {
     const s = db.seedFor(day, () => {
@@ -122,11 +135,28 @@ export async function startServer(o: ServerOptions = {}) {
   // ---------- WebSocket ----------
 
   const wss = new WebSocketServer({ server: http, path: '/ws', maxPayload: 4096 });
+  /** A connection, as far as runs are concerned: who it is and how to reach it. */
+  interface Conn { ws: WebSocket; send: (m: ServerMsg) => void }
+  const attachedBy = new Map<RunSession, Conn>();
+
+  function attach(s: RunSession, c: Conn, lite: boolean): void {
+    const prev = attachedBy.get(s);
+    if (prev && prev.ws !== c.ws) {
+      // one screen per run: the newest connection wins
+      prev.send({ t: 'error', code: 'replaced', msg: 'This run was opened somewhere else.' });
+      s.detach();
+      prev.ws.close();
+    }
+    attachedBy.set(s, c);
+    s.attach(c.send, lite);
+  }
+
   wss.on('connection', (ws: WebSocket) => {
     let session: RunSession | null = null;
     let player: { id: number; name: string } | null = null;
     let windowStart = now(), count = 0;
     const send = (m: ServerMsg) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(m)) };
+    const conn: Conn = { ws, send };
     const fail = (code: string, msg: string) => { send({ t: 'error', code, msg }); ws.close() };
 
     ws.on('message', (data) => {
@@ -144,25 +174,41 @@ export async function startServer(o: ServerOptions = {}) {
         const login = db.login(m.name.trim(), typeof m.token === 'string' ? m.token : undefined, t);
         if ('error' in login) return fail('name', login.error);
         player = { id: login.player.id, name: login.player.name };
+        const lite = !!m.lite;
+
+        // A run already going for this player is resumed, never restarted.
+        const prior = live.get(player.id) ?? (m.resume ? recentFor(player.id) : undefined);
+        if (prior) {
+          session = prior;
+          const { commit } = daySeed(prior.info.day);
+          send({ t: 'welcome', name: player.name, player: player.id, token: login.token, day: prior.info.day, attempt: prior.info.attempt,
+            attemptsLeft: Math.max(0, cap - db.attemptsUsed(player.id, prior.info.day)), commit, mint: prior.info.mint, resumed: true });
+          attach(prior, conn, lite);
+          return;
+        }
+        if (m.resume) return fail('resume', 'There is no ranked run to resume.');
+
         const day = utcDay(t);
         const { seed, commit } = daySeed(day);
         const started = db.startRun(player.id, day, cap, (attempt) => runSeedOf(seed, player!.id, attempt), t);
         if (!started) return fail('attempts', `No ranked attempts left today (${cap} per day). Practice is unlimited.`);
-        send({ t: 'welcome', name: player.name, player: player.id, token: login.token, day, attempt: started.attempt, attemptsLeft: started.attemptsLeft, commit, mint: started.mint });
-        session = new RunSession(
+        send({ t: 'welcome', name: player.name, player: player.id, token: login.token, day, attempt: started.attempt, attemptsLeft: started.attemptsLeft, commit, mint: started.mint, resumed: false });
+        const s = new RunSession(
           { run: started.run, player: player.id, day, attempt: started.attempt, seed: started.seed, mint: started.mint },
           {
-            send,
             signer: signer.publicHex,
             sign: (msg) => signer.sign(msg),
-            finish: (s, receipt, att) => {
-              live.delete(s);
-              db.finishRun(s.info.run, receipt.result.layers, receipt.result.bank, JSON.stringify(receipt), att.receiptHash, JSON.stringify(att), now());
+            finish: (fs, receipt, att) => {
+              live.delete(fs.info.player);
+              recent.set(fs.info.player, { s: fs, at: now() });
+              db.finishRun(fs.info.run, receipt.result.layers, receipt.result.bank, JSON.stringify(receipt), att.receiptHash, JSON.stringify(att), now());
             },
           },
-          { tickMs, lite: !!m.lite, idleMs },
+          { tickMs, idleMs },
         );
-        live.add(session);
+        live.set(player.id, s);
+        session = s;
+        attach(s, conn, lite);
         return;
       }
 
@@ -182,7 +228,10 @@ export async function startServer(o: ServerOptions = {}) {
       }
     });
 
-    ws.on('close', () => { if (session && !session.done) session.disconnect() });
+    ws.on('close', () => {
+      // The run is not touched: it keeps its clock and waits for this player to come back.
+      if (session && attachedBy.get(session) === conn) { attachedBy.delete(session); session.detach() }
+    });
     ws.on('error', () => { /* close follows */ });
   });
 
@@ -196,8 +245,10 @@ export async function startServer(o: ServerOptions = {}) {
     signer: signer.publicHex,
     db,
     liveCount: () => live.size,
+    /** True while this player has a run in progress (attached or not). */
+    hasLiveRun: (player: number) => live.has(player),
     async close(): Promise<void> {
-      for (const s of live) s.disconnect();
+      for (const s of [...live.values()]) s.finishUnattended();
       for (const c of wss.clients) c.terminate();
       await new Promise<void>((r) => wss.close(() => r()));
       await new Promise<void>((r) => http.close(() => r()));

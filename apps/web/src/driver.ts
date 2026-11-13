@@ -1,4 +1,4 @@
-import type { Button, EngineEvent, View } from '@exit-liquidity/engine';
+import type { Button, PublicEvent, View } from '@exit-liquidity/engine';
 
 /**
  * What the UI talks to. Practice runs the engine in the page (LocalDriver).
@@ -19,7 +19,7 @@ export interface Driver {
   receipt(): Promise<string>;
   close(): void;
   /** Juice: sounds, pops and shakes. */
-  onEvents: (ev: EngineEvent[]) => void;
+  onEvents: (ev: PublicEvent[]) => void;
   /** Phase changed or a modal needs to re-render. */
   onChange: () => void;
 }

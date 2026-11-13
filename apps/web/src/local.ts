@@ -1,11 +1,11 @@
-import { TICK_MS, engine, nativeEngine, type Button, type Engine, type EngineEvent, type RunState, type View } from '@exit-liquidity/engine';
+import { TICK_MS, engine, nativeEngine, type Button, type Engine, type PublicEvent, type RunState, type View, toPublicEvents } from '@exit-liquidity/engine';
 import type { Driver } from './driver.ts';
 
 /** Practice mode and the title screen chart: the engine runs right here in the page. */
 export class LocalDriver implements Driver {
   readonly kind: 'attract' | 'practice';
   view: View | null = null;
-  onEvents: (ev: EngineEvent[]) => void = () => {};
+  onEvents: (ev: PublicEvent[]) => void = () => {};
   onChange: () => void = () => {};
   private S: RunState;
   private acc = 0;
@@ -33,7 +33,7 @@ export class LocalDriver implements Driver {
   step(): void {
     const before = this.S.phase;
     const ev = this.eng.tick(this.S);
-    if (ev.length) { this.view = this.eng.view(this.S); this.onEvents(ev) }
+    if (ev.length) { this.view = this.eng.view(this.S); this.onEvents(toPublicEvents(ev)) }
     if (this.S.phase !== before) this.changed();
   }
 
@@ -45,7 +45,7 @@ export class LocalDriver implements Driver {
     const before = this.S.phase;
     const r = this.eng.applyInput(this.S, code);
     this.view = this.eng.view(this.S);
-    if (r.events.length) this.onEvents(r.events);
+    if (r.events.length) this.onEvents(toPublicEvents(r.events));
     if (this.S.phase !== before || before !== 'play') this.onChange();
   }
 

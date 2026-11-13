@@ -1,19 +1,24 @@
 // One ranked run held by the server. The engine state never leaves this object
 // except as the public View. Inputs are applied the moment they arrive, so the
 // tick the engine logs them at is the tick the server stamped them with.
+//
+// A run is not tied to a connection. A client attaches, may drop, and may
+// attach again: the run keeps going on the server the whole time and the
+// clock never pauses for anyone. Reattaching sends a full snapshot.
 
 import {
-  engine, attestationMessage, canonicalReceipt, IND,
+  engine, attestationMessage, toPublicEvents, canonicalReceipt, IND,
   type Attestation, type Button, type EngineEvent, type RankedReceipt, type RunState, type ServerMsg, type LiteState,
 } from '@exit-liquidity/engine';
 import { performance } from 'node:perf_hooks';
-import { keccakHex } from './seeds.ts';
+import { keccakHex, RANKED_RNG } from './seeds.ts';
 
 
-export interface SessionInfo { run: number; player: number; day: string; attempt: number; seed: number; mint: string | null }
+export interface SessionInfo { run: number; player: number; day: string; attempt: number; seed: string; mint: string | null }
+
+export type Sender = (m: ServerMsg) => void;
 
 export interface SessionHooks {
-  send(m: ServerMsg): void;
   finish(s: RunSession, receipt: RankedReceipt, attestation: Attestation): void;
   sign(msg: string): string;
   signer: string;
@@ -29,18 +34,33 @@ export class RunSession {
   private timer: NodeJS.Timeout | null = null;
   private immediate: NodeJS.Immediate | null = null;
   private nextAt = 0;
-  private connected = true;
+  private sender: Sender | null = null;
+  private lite = false;
   private idleTimer: NodeJS.Timeout | null = null;
 
   constructor(
     readonly info: SessionInfo,
     private hooks: SessionHooks,
-    private opts: { tickMs: number; lite: boolean; idleMs: number },
+    private opts: { tickMs: number; idleMs: number },
   ) {
-    this.S = engine.createRun(info.seed, info.mint);
-    this.snap([]);
+    this.S = engine.createRun(info.seed, info.mint, RANKED_RNG);
     this.armIdle();
   }
+
+  get attached(): boolean { return this.sender !== null }
+
+  /** Connects a client. It gets a full snapshot now (and the result, if the run already ended), then live updates. */
+  attach(send: Sender, lite: boolean): void {
+    this.sender = send;
+    this.lite = lite;
+    this.snap([]);
+    if (this.ended) send({ t: 'end', run: this.info.run, receipt: this.ended.receipt, attestation: this.ended.attestation });
+  }
+
+  /** The client went away. Nothing else changes: the clock keeps running and the run plays on. */
+  detach(): void { this.sender = null }
+
+  private send(m: ServerMsg): void { if (this.sender) this.sender(m) }
 
   // ---------- client messages ----------
 
@@ -100,29 +120,29 @@ export class RunSession {
   step(): void {
     const before = this.S.phase;
     const ev = engine.tick(this.S);
-    if (this.connected) this.sendTick(ev);
+    if (this.sender) this.sendTick(ev);
     if (this.S.phase !== before) this.afterChange(before, ev, false);
   }
 
   private sendTick(ev: EngineEvent[]): void {
     const S = this.S, k = S.m.t - S.lv.t0;
-    if (this.opts.lite) {
+    if (this.lite) {
       const L = S.lv;
       const s: LiteState = {
-        phase: S.phase, i: S.i, cash: L.cash, debt: L.debt, equity: engine.equity(S), target: L.target,
+        phase: S.phase, i: S.i, equity: engine.equity(S), target: L.target,
         pos: L.pos ? { dir: L.pos.dir, entry: L.pos.entry, lev: L.pos.lev, ret: Math.max(0, L.pos.margin * (1 + L.pos.lev * L.pos.dir * (S.m.p / L.pos.entry - 1))) / L.pos.margin - 1, locked: false } : null,
         ready: S.phase === 'play' && !L.pos && L.cash - L.debt >= L.target, left: Math.max(0, L.dur - (S.m.t - L.t0)),
       };
-      this.hooks.send({ t: 'tick', k, p: S.m.p, s, ev });
+      this.send({ t: 'tick', k, p: S.m.p, s, ev: toPublicEvents(ev) });
       return;
     }
     const { candles, cur, ...v } = engine.view(S);
     const closed = !cur;
     const c = closed ? candles[candles.length - 1]! : cur;
-    this.hooks.send({ t: 'tick', k, v, c, closed, ev });
+    this.send({ t: 'tick', k, v, c, closed, ev: toPublicEvents(ev) });
   }
 
-  private snap(ev: EngineEvent[]): void { if (this.connected) this.hooks.send({ t: 'snap', v: engine.view(this.S), ev }) }
+  private snap(ev: EngineEvent[]): void { if (this.sender) this.send({ t: 'snap', v: engine.view(this.S), ev: toPublicEvents(ev) }) }
 
   // ---------- idle and disconnects ----------
 
@@ -134,12 +154,12 @@ export class RunSession {
   private disarmIdle(): void { if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null } }
 
   /**
-   * The player left or went idle. The run is not thrown away (that would let
-   * players peek at a chart and retry): it plays out with no further input,
-   * leaving the shop untouched, and the result counts.
+   * Nobody pressed anything on an intro or shop screen for idleMs (connected
+   * or not), or the server is shutting down. The run is not thrown away (that
+   * would let players peek at a chart and retry): it plays out with no further
+   * input, leaving the shop untouched, and the result counts.
    */
   finishUnattended(): void {
-    this.connected = false;
     this.stopClock();
     this.disarmIdle();
     let guard = 0;
@@ -151,7 +171,6 @@ export class RunSession {
     this.end();
   }
 
-  disconnect(): void { if (!this.done) this.finishUnattended(); else this.connected = false }
 
   // ---------- end ----------
 
@@ -167,7 +186,7 @@ export class RunSession {
     const attestation: Attestation = { ...body, signer: this.hooks.signer, sig: this.hooks.sign(attestationMessage(body)) };
     this.ended = { receipt, attestation };
     this.hooks.finish(this, receipt, attestation);
-    if (this.connected) this.hooks.send({ t: 'end', run: this.info.run, receipt, attestation });
+    this.send({ t: 'end', run: this.info.run, receipt, attestation });
   }
 
   /** Indicators the player held when the run ended; only these can be minted (spec section 6). */

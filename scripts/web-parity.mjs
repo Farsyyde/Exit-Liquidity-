@@ -79,7 +79,10 @@ for (const [n, run] of golden.runs.slice(0, LIMIT).entries()) {
   await page.evaluate((mint) => { localStorage.clear(); if (mint) localStorage.setItem('exitliq_mint', JSON.stringify({ id: mint, runs: 3 })); }, run.receipt.mint);
   const out = await page.evaluate(drive, run);
   const layers = run.final.won ? 8 : run.final.i;
-  const same = out.receipt === JSON.stringify(run.receipt) && out.used === run.receipt.log.length &&
+  // The web app writes v3 receipts (generator recorded). Content must equal the prototype's v2 receipt.
+  const rc = JSON.parse(out.receipt), p = run.receipt;
+  const same = rc.v === 3 && rc.rng === 'mulberry32' && rc.math === undefined &&
+    JSON.stringify([rc.seed, rc.mint, rc.log, rc.result]) === JSON.stringify([p.seed, p.mint, p.log, p.result]) && out.used === run.receipt.log.length &&
     out.bankText === fm(run.final.bank) && out.layersText === layers + ' of 8';
   if (!same) { bad++; console.log('MISMATCH run', n, out.receipt.slice(0, 200), 'want', JSON.stringify(run.receipt).slice(0, 200)); }
 }

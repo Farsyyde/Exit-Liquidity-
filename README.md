@@ -16,7 +16,7 @@ Node 22 and pnpm 10.
 
 ```sh
 pnpm install
-pnpm test              # engine golden/property tests, server and verifier tests (93 tests)
+pnpm test              # engine, server, verifier, stream audit, reconnect and secrecy tests (121 tests)
 pnpm typecheck
 pnpm build:web && pnpm server     # http://127.0.0.1:8787 serves the game and the ranked API
 pnpm dev:web           # Vite dev server, proxies /api and /ws to the run server
@@ -28,6 +28,7 @@ Exit tests:
 pnpm parity            # M0: web app replays 66 prototype runs through the real UI, 66/66 must match
 pnpm m1:exit           # M1: 1,000 scripted ranked runs, then the verifier CLI checks every one
 pnpm golden:record     # re-record golden receipts from reference/prototype.html (needs Chromium)
+pnpm --filter @exit-liquidity/server sim 50000   # balance sim, mulberry32 vs xoshiro256** (docs/balance-rng.md)
 ```
 
 Verifier:
@@ -44,7 +45,16 @@ It exits nonzero on any mismatch.
 
 - `packages/engine` exposes `createRun(seed, mint)`, `applyInput(state, code)`, `tick(state)`, `replay(receipt)`, `receipt(state)` and `view(state)`. State is plain JSON; a JSON round trip mid run continues identically (tested).
 - All rules that lived in prototype UI functions (`openPos`, `closePos`, `useCons`, `endLevel`, `prepLevel`, `rollOffers`, `tick`) are in the engine, written with the same operation order as the prototype because float results depend on it.
-- Receipts keep the prototype's v2 format (`{game, v, seed, mint, log, result}`). Phase changes the prototype never logged (opening the chart, leaving the shop) are inferred during replay, as the format requires.
+- Receipts are v3: `{game, v: 3, rng, seed, mint, log, result, math}`. `rng` names the generator. The prototype's v2 receipts (no `rng`, always mulberry32) still replay. Phase changes the prototype never logged (opening the chart, leaving the shop) are inferred during replay, as the format requires.
+
+### Random generators
+
+The generator is injected (`makeEngine(math, mathId, generators)`) and chosen per run (`createRun(seed, mint, rng)`):
+
+- **Practice: `mulberry32`**, seeded with a uint32, exactly as the prototype. This keeps the prototype golden tests exact.
+- **Ranked: `xoshiro256**`**, seeded with the full 32 byte keccak hash (the four state words are the hash read as big-endian uint64s). The shop stream is the run stream jumped 2^128 ahead. The port is checked bit for bit against Blackman and Vigna's reference C (outputs, doubles and `jump`), with pinned vectors in `packages/engine/test/rng.test.ts`.
+
+Balance did not move: 50,000 runs per arm, same bots and same bot randomness, only the market generator changed. The largest per-layer difference across 16 comparisons was |z| = 1.96, about what chance alone gives. Full table in `docs/balance-rng.md`.
 
 ### Float determinism (decision taken: spec option 2 now, not later)
 
@@ -68,12 +78,18 @@ So the engine ships `fixedMath`, a straight port of fdlibm's exp, log and cos th
 
 ## M1: ranked, off chain
 
-- **Seeds.** Each UTC day gets a 32 byte secret seed. `GET /api/commit/:day` publishes `keccak256(seed)` (today or tomorrow, so it can be recorded before the day starts). `runSeed = uint32(keccak256(dailySeed ++ uint256(player) ++ uint256(attempt)))`. The player id stands in for the pass id until M2.
-- **Server authority.** The client never receives the seed before the run ends and never computes prices. It gets the public `View` (no pending events, no RNG state; fake-news flags only with Insider, the fair value line only with Fair Value) and per tick updates.
+- **Seeds.** Each UTC day gets a 32 byte secret seed. `GET /api/commit/:day` publishes `keccak256(seed)` (today or tomorrow, so it can be recorded before the day starts). `runSeed = keccak256(dailySeed ++ uint256(player) ++ uint256(attempt))`, all 32 bytes, seeding xoshiro256**. The player id stands in for the pass id until M2.
+- **Server authority.** The client never receives the seed before the run ends and never computes prices. It gets only what its screen can show:
+  - no event queue, generator state, fair value internals, cash or debt, and headlines without an event type (the player reads the text);
+  - fake-news flags only with Insider, the fair value line only with Fair Value, the sniper line only with Dip Sniper, all only while trading;
+  - the exact fake-news rate only when the intro shows its chip (30% or more), shop offers only in the shop, the run summary and seed only at the end.
+
+  Views and events are built field by field, and `apps/server/test/stream-audit.test.ts` checks every message of real runs against a key allowlist and those rules.
+- **Reconnect.** A run belongs to the player, not the connection. If the socket drops, the run keeps going at the server and the clock never pauses. The client retries with `hello {resume: true}` and gets a full snapshot (chart history included), then live ticks. A second connection takes over the run and the first is told why. `resume` never starts a new attempt, and a plain hello while a run is live resumes that run. A run that ends while the player is away hands over its result when they come back (kept 15 minutes).
 - **Stamping.** Inputs are applied the moment they arrive, so the engine logs them at the tick the server stamped. That log is the receipt.
 - **Results.** At run end the server signs `{run, day, player, attempt, receiptHash, layers, bank}` with ed25519 (`receiptHash` = keccak256 of the canonical receipt). M2 swaps this for EIP-712 so `RunRegistry` can check it on chain.
 - **Reveal.** `GET /api/seed/:day` and `GET /api/runs/:day` only answer after the day closes (UTC). Then anyone can run the verifier.
-- **Leaving early does not help.** A disconnect, or 5 minutes idle on an intro or shop screen, plays the run out with no further input and the result counts. Otherwise players could peek at a chart and retry.
+- **Leaving early does not help.** A player who never comes back gets the run played out without them: the clock runs the level down, and 5 minutes idle on an intro or shop screen finishes the rest with no input. The result counts. Otherwise players could peek at a chart and retry.
 - **Identity.** A name plus a server-issued token kept in the browser. No wallet in M1.
 - **Limits.** 3 ranked attempts per player per day (configurable), 40 messages per second per connection, 4 KB max message.
 - **Minting.** Kept on the server as a stand-in for the ERC-1155: only an indicator held at run end, once per run, 3 charges, one charge used per ranked run.
@@ -81,20 +97,20 @@ So the engine ships `fixedMath`, a straight port of fdlibm's exp, log and cos th
 
 ### Exit test result
 
-`pnpm m1:exit` (1,000 runs, 100 concurrent bots over real WebSockets, 4 ms ticks):
+`pnpm m1:exit` (1,000 runs, 100 concurrent bots over real WebSockets, 4 ms ticks, xoshiro256**):
 
 ```
 stored 1000, verifier exit 0, "1000/1000 runs verified"
-runs ending on layer 0..8: 246, 285, 201, 135, 64, 47, 7, 13, 2
-39 runs abandoned mid run (finished unattended), 2,236 shop inputs, 192 mints, 48.7 s
+runs ending on layer 0..8: 250, 297, 183, 155, 53, 42, 8, 7, 5
+125 runs dropped and resumed mid run (5 to 80 ticks passed while away), 25 abandoned for good
+2,251 shop inputs, 192 mints, 48.9 s
 ```
 
 The verifier runs as a separate process, fetches the revealed seed and published receipts over HTTP like an outsider would, and checks the seed against the commit recorded before the runs started.
 
 ## Open items before anything involving money (M2+)
 
-1. **PRNG width (spec open decision 4), not done.** Ranked still uses 32 bit `mulberry32` so receipts stay compatible with the prototype. A 32 bit seed can be brute forced from the first few observed prices with a precomputed table. Move ranked to a wider generator seeded from the full hash before prizes. This changes game rules for ranked, so it needs a decision.
-2. **Headline bots (spec section 8).** The tick stream includes the headline `type` field (the client uses it for the rug sound). The scripted headline bot in `apps/server/src/bot.ts` cleared layer 1 in 754 of 1,000 exit test runs. Dropping `type` from the stream is easy; the deeper mitigations are still open.
-3. **Seed custody.** Daily seeds sit in SQLite in plain text. Spec section 7 wants a KMS before this matters.
-4. **No reconnect.** A dropped connection ends the player's control of that run. It still plays out and counts.
-5. **Signer key** is a local PEM in `apps/server/data/` (gitignored). Rotation is manual.
+1. **Headline bots (spec section 8).** The stream no longer carries a headline's event type, but the headline table ships with the client, so a bot reads the type back from the text in a few lines (`apps/server/src/headlines.ts` does exactly that for our bots). This is hygiene, not a defense. The headline bot clears layer 1 in about 82% of simulated runs.
+2. **Seed custody.** Daily seeds sit in SQLite in plain text, under `apps/server/data/` by default (gitignored). They are never logged (the logger also redacts any 32 byte hex value), never sent before the reveal, and not in the repo or its history; `apps/server/test/secrets.test.ts` checks all of that. A KMS is still later work.
+3. **Server restarts.** Live runs do not survive one. A clean shutdown plays them out unattended; after a crash they are voided on startup (the attempt is used, nothing scores). Reconnect covers dropped clients, not a dropped server.
+4. **Signer key** is a local PEM in `apps/server/data/` (gitignored). Rotation is manual.

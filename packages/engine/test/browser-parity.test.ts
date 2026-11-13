@@ -31,7 +31,8 @@ describe.skipIf(!chromium)('engine in Chromium vs prototype in Chromium (native 
             ok: true,
             same: S.bank === run.final.bank && S.best === run.final.best && S.credits === run.final.credits &&
               S.trades === run.final.trades && S.i === run.final.i &&
-              JSON.stringify(eng.receipt(S)) === JSON.stringify(run.receipt),
+              (() => { const rc = eng.receipt(S), p = run.receipt; return rc.v === 3 && rc.rng === 'mulberry32' && rc.math === undefined &&
+                JSON.stringify([rc.seed, rc.mint, rc.log, rc.result]) === JSON.stringify([p.seed, p.mint, p.log, p.result]) })(),
             bank: S.bank, want: run.final.bank,
           };
         });

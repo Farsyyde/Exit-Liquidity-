@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS runs (
   player_id INTEGER NOT NULL REFERENCES players(id),
   day TEXT NOT NULL,
   attempt INTEGER NOT NULL,
-  seed INTEGER NOT NULL,
+  seed TEXT NOT NULL,
   mint TEXT,
   status TEXT NOT NULL,
   layers INTEGER,
@@ -112,7 +112,7 @@ export function openDb(path: string) {
     attemptsUsed(player: number, day: string): number { return (q.attempts.get(player, day) as { n: number }).n },
 
     /** Reserves the next attempt and consumes one minted charge, atomically. */
-    startRun: db.transaction((player: number, day: string, cap: number, seedOf: (attempt: number) => number, now: number) => {
+    startRun: db.transaction((player: number, day: string, cap: number, seedOf: (attempt: number) => string, now: number) => {
       const used = (q.attempts.get(player, day) as { n: number }).n;
       if (used >= cap) return null;
       const attempt = used + 1;

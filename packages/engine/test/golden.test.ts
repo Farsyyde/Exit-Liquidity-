@@ -42,8 +42,10 @@ describe('golden receipts recorded from the prototype (fixed math)', () => {
       expect(S.whaleMult).toBe(run.final.whaleMult);
       expect(!!S.won).toBe(run.final.won);
       expect(S.cons.filter(Boolean).sort()).toEqual(run.final.cons.filter(Boolean).sort());
-      // the engine's own receipt is identical to the prototype's
-      expect(engine.receipt(S)).toEqual({ ...run.receipt, math: FIXED_MATH_ID });
+      // the engine's own receipt carries the prototype's seed, mint, log and result,
+      // in v3 form: same content plus the generator and math ids
+      const { v: _v, ...proto } = run.receipt;
+      expect(engine.receipt(S)).toEqual({ ...proto, v: 3, rng: 'mulberry32', math: FIXED_MATH_ID });
     });
   }
 });

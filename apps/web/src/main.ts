@@ -2,16 +2,17 @@
 // reference/prototype.html. Game rules live in @exit-liquidity/engine; this
 // file only reads the public View and dispatches inputs through a Driver.
 
-import { CON, CSLOTS, IND, LEVELS, fm, fp, type EngineEvent, type View } from '@exit-liquidity/engine';
+import { CON, CSLOTS, IND, LEVELS, fm, fp, type PublicEvent, type View } from '@exit-liquidity/engine';
 import type { Driver } from './driver.ts';
 import { LocalDriver } from './local.ts';
-import { RemoteDriver, rankedAvailable, loadIdentity, saveIdentity, fetchLeaderboard } from './remote.ts';
+import { RemoteDriver, rankedAvailable, loadIdentity, saveIdentity, fetchLeaderboard, type LinkStatus } from './remote.ts';
 
 const MINT_KEY = 'exitliq_mint';
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
 const params = new URLSearchParams(location.search);
 const NATIVE = params.get('math') === 'native';
 const MANUAL = params.has('manual');
+const TEST = MANUAL || params.has('test');
 
 let drv: Driver | null = null;      // the run being played, if any
 let attract: LocalDriver = new LocalDriver({ seed: rndSeed(), mint: null, attract: true, native: NATIVE });
@@ -60,11 +61,12 @@ function readMint(): Mint | null {
 function writeMint(v: Mint): void { try { localStorage.setItem(MINT_KEY, JSON.stringify(v)) } catch { /* private mode */ } }
 
 /* ---------- events to juice ---------- */
-function onEvents(evs: EngineEvent[]): void {
+function onEvents(evs: PublicEvent[]): void {
   for (const e of evs) {
     switch (e.k) {
       case 'headline':
-        if (!e.mine && playing()) beep(e.type === 'rug' ? 180 : 880, .05, 'triangle', .04);
+        // no event type on the wire: rug warnings are the headlines that say WARNING
+        if (!e.mine && playing()) beep(e.text.startsWith('WARNING') ? 180 : 880, .05, 'triangle', .04);
         renderNews();
         break;
       case 'open':
@@ -114,12 +116,21 @@ function onChange(): void {
   else if (v.phase === 'end') showEnd();
 }
 
+function onLink(s: LinkStatus): void {
+  const info = $('info');
+  if (s === 'ok') info.textContent = 'Reconnected. The run kept going while you were away.';
+  else if (s === 'reconnecting') info.textContent = 'CONNECTION LOST. RECONNECTING, THE CLOCK KEEPS RUNNING.';
+  else if (s === 'replaced') show('<h1>OPENED ELSEWHERE</h1><p>This ranked run is now being played in another window or tab.</p><div class="row"><button class="btn alt" data-act="title" type="button">OK</button></div>');
+  else show('<h1>CONNECTION LOST</h1><p>Could not get back to the run server. The run plays on there without you and its result still counts.</p><div class="row"><button class="btn alt" data-act="title" type="button">OK</button></div>');
+}
+
 function startRun(d: Driver): void {
   if (drv) drv.close();
   drv = d;
   ranked = d.kind === 'ranked';
   d.onEvents = onEvents;
   d.onChange = onChange;
+  if (d instanceof RemoteDriver) d.onStatus = onLink;
   lastPhase = '';
   vlo = vhi = null;
   $('info').textContent = 'Tap an indicator to read what it does.';
@@ -346,7 +357,7 @@ function showIntro(): void {
   const v = V(), L = v.level;
   let chips = '';
   if (L.rug) chips += '<span class="chip">RUGS ENABLED</span>';
-  if (L.fake >= .3) chips += '<span class="chip y">FAKE NEWS ' + Math.round(L.fake * 100) + '%</span>';
+  if (L.fakeChip != null) chips += '<span class="chip y">FAKE NEWS ' + Math.round(L.fakeChip * 100) + '%</span>';
   if (L.hunter) chips += '<span class="chip b">BOSS: THE MARKET MAKER</span>';
   dispEq = L.start;
   renderNews(); renderInds(); renderCons();
@@ -397,7 +408,8 @@ function showEnd(): void {
   screen = 'end';
   const v = V(), e = v.end!, L = v.level;
   const won = e.won;
-  const seed = e.seed.toString(16).toUpperCase().padStart(8, '0');
+  // mulberry32 seeds are 8 hex digits; ranked xoshiro seeds are 64, shown shortened
+  const seed = typeof e.seed === 'number' ? e.seed.toString(16).toUpperCase().padStart(8, '0') : e.seed.slice(2, 14).toUpperCase() + '..';
   let h = won ? '<span class="eyebrow">LAYER 0</span><h1>REALITY</h1><p>The terminal goes dark. You are at your desk. It is 4:12 AM. Your real portfolio is down 3%. It is, somehow, a relief.</p>'
     : '<span class="eyebrow">LAYER ' + (LEVELS.length - v.i) + ', ' + L.tk + '</span><h1>MARGIN CALLED</h1><p>You needed ' + fm(L.target) + ' and closed with ' + fm(e.bank) + '. The terminal resets. So do you.</p>';
   h += '<div class="stat"><span>Layers cleared</span><span id="endLayers">' + e.layers + ' of ' + LEVELS.length + '</span>' +
@@ -485,4 +497,4 @@ requestAnimationFrame(frame);
 void rankedAvailable().then((up) => { rankedUp = up; if (screen === 'title') showTitle() });
 
 // Test hook: lets a scripted browser step ticks deterministically (?manual).
-if (MANUAL) (window as any).__el = { get drv() { return drv }, step(n = 1) { for (let k = 0; k < n; k++) (drv as LocalDriver | null)?.step(); drv?.frame(0) } };
+if (TEST) (window as any).__el = { get drv() { return drv }, step(n = 1) { for (let k = 0; k < n; k++) (drv as LocalDriver | null)?.step(); drv?.frame(0) } };

@@ -12,7 +12,7 @@ import {
   CANDLE, CON, CSLOTS, HEAD, IND, INDS, CONS, K, LEVELS, MAX_CANDLES, SLOTS, WARMUP,
   type EventType, type LevelDef,
 } from './tables.ts';
-import { mulberry32Step, shopSeed } from './rng.ts';
+import { GENERATORS, type Generator, type RngState, type Seed } from './rng.ts';
 
 // ---------- types ----------
 
@@ -88,9 +88,11 @@ export interface ClearInfo { bank: number; target: number; a: number; b: number;
 export type LogEntry = [layer: number, tick: number, code: string];
 
 export interface RunState {
-  seed: number;
-  rng: number;
-  shopRng: number;
+  /** Generator id, a key of the engine's generator registry. */
+  gen: string;
+  seed: Seed;
+  rng: RngState;
+  shopRng: RngState;
   phase: Phase;
   i: number;
   bank: number;
@@ -127,10 +129,43 @@ export type EngineEvent =
 
 export interface InputResult { ok: boolean; events: EngineEvent[] }
 
+/**
+ * Events as a client may see them. Same as EngineEvent except headlines carry
+ * no event type: the player reads the text, like on screen.
+ */
+export type PublicEvent =
+  | { k: 'headline'; text: string; flagged: boolean; mine: boolean }
+  | Exclude<EngineEvent, { k: 'headline' }>;
+
+/** Rebuilds each event field by field, so nothing outside the public shape survives. */
+export function toPublicEvents(ev: readonly EngineEvent[]): PublicEvent[] {
+  return ev.map((e): PublicEvent => {
+    switch (e.k) {
+      case 'headline': return { k: 'headline', text: e.text, flagged: e.flagged, mine: e.mine };
+      case 'open': return { k: 'open', dir: e.dir, snipe: e.snipe };
+      case 'win': return { k: 'win', total: e.total, mult: e.mult, tags: e.tags.slice(), streak: e.streak, big: e.big };
+      case 'loss': return { k: 'loss', loss: e.loss, notes: e.notes.slice() };
+      case 'item': {
+        const o: PublicEvent = { k: 'item', id: e.id };
+        if (e.amount !== undefined) o.amount = e.amount;
+        if (e.into !== undefined) o.into = e.into;
+        return o;
+      }
+      case 'countdown': return { k: 'countdown', left: e.left };
+      case 'cleared': return { k: 'cleared', bank: e.bank, target: e.target, a: e.a, b: e.b, c: e.c, last: e.last };
+      case 'failed': return { k: 'failed', bank: e.bank, target: e.target };
+      case 'liquidated': case 'apeLocked': case 'reorgEmpty': return { k: e.k };
+    }
+  });
+}
+
 export interface Receipt {
   game: 'exit-liquidity';
-  v: 2;
-  seed: number;
+  /** 2: the prototype's format, always mulberry32. 3: adds rng. */
+  v: 2 | 3;
+  /** Generator id. Absent in v2 receipts, which are mulberry32. */
+  rng?: string;
+  seed: Seed;
   mint: string | null;
   log: LogEntry[];
   result: RunResult;
@@ -151,20 +186,17 @@ export interface ReplayOutcome {
 
 // ---------- factory ----------
 
-export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
+export function makeEngine(math: MathImpl = Math, mathId: string = 'native', generators: Readonly<Record<string, Generator>> = GENERATORS) {
   const { exp, log, cos } = math;
 
+  function genOf(id: string): Generator {
+    const g = generators[id];
+    if (!g) throw new Error('unknown generator: ' + id);
+    return g;
+  }
   // random draws mutate the stored generator state
-  function rnd(S: RunState): number {
-    const [a, v] = mulberry32Step(S.rng);
-    S.rng = a;
-    return v;
-  }
-  function shopRnd(S: RunState): number {
-    const [a, v] = mulberry32Step(S.shopRng);
-    S.shopRng = a;
-    return v;
-  }
+  function rnd(S: RunState): number { return genOf(S.gen).next(S.rng) }
+  function shopRnd(S: RunState): number { return genOf(S.gen).next(S.shopRng) }
   function gauss(S: RunState): number {
     let u = 0;
     while (u === 0) u = rnd(S);
@@ -273,10 +305,10 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
 
   // ---------- run and level setup ----------
 
-  function blankRun(seed: number): RunState {
-    seed = seed >>> 0;
+  function blankRun(seed: Seed, gen: string): RunState {
+    const { run, shop } = genOf(gen).init(seed);
     const S = {
-      seed, rng: seed, shopRng: shopSeed(seed), phase: 'intro', i: 0, bank: 100, credits: 0,
+      gen, seed, rng: run, shopRng: shop, phase: 'intro', i: 0, bank: 100, credits: 0,
       inds: [], cons: [null, null], nft: null, streak: 0, trades: 0, best: 0, bagMult: 0, whaleMult: 0,
       martin: false, log: [], offers: [], clear: null, won: null,
     } as unknown as RunState;
@@ -309,10 +341,14 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
     S.lv.high = S.m.p;
   }
 
-  /** A new run waiting on the intro screen of layer 1. */
-  function createRun(seed: number, mint: string | null = null): RunState {
+  /**
+   * A new run waiting on the intro screen of layer 1. Practice uses mulberry32
+   * with a uint32 seed (the prototype's rules); ranked uses xoshiro256** with a
+   * 32 byte seed.
+   */
+  function createRun(seed: Seed, mint: string | null = null, gen: string = 'mulberry32'): RunState {
     if (mint != null && !IND[mint]) throw new Error('unknown minted indicator: ' + mint);
-    const S = blankRun(seed);
+    const S = blankRun(seed, gen);
     S.nft = mint;
     prepLevel(S, true);
     S.phase = 'intro';
@@ -321,7 +357,7 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
 
   /** The background chart behind the title screen. Not a run. */
   function createAttract(seed: number): RunState {
-    const S = blankRun(seed);
+    const S = blankRun(seed, 'mulberry32');
     prepLevel(S, false);
     S.phase = 'attract';
     return S;
@@ -587,7 +623,7 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
   }
 
   function receipt(S: RunState): Receipt {
-    const r: Receipt = { game: 'exit-liquidity', v: 2, seed: S.seed, mint: S.nft, log: S.log.map((e) => [e[0], e[1], e[2]] as LogEntry), result: result(S) };
+    const r: Receipt = { game: 'exit-liquidity', v: 3, rng: S.gen, seed: S.seed, mint: S.nft, log: S.log.map((e) => [e[0], e[1], e[2]] as LogEntry), result: result(S) };
     if (mathId !== 'native') r.math = mathId;
     return r;
   }
@@ -597,14 +633,17 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
    * that the log does not record (opening the chart, leaving the shop) are
    * implied by the order of entries, as in the prototype.
    */
-  function replay(r: Pick<Receipt, 'seed' | 'mint' | 'log' | 'math'>, opts: { maxTicks?: number; anyMath?: boolean } = {}): ReplayOutcome {
+  function replay(r: Pick<Receipt, 'v' | 'rng' | 'seed' | 'mint' | 'log' | 'math'>, opts: { maxTicks?: number; anyMath?: boolean } = {}): ReplayOutcome {
     const fail = (error: string, state: RunState | null = null): ReplayOutcome => ({ ok: false, error, result: null, state });
     if ((r.math ?? 'native') !== mathId && !opts.anyMath) return fail('receipt math ' + (r.math ?? 'native') + ' does not match engine math ' + mathId);
-    if (!Number.isInteger(r.seed) || r.seed < 0 || r.seed > 0xffffffff) return fail('bad seed');
+    let gen: string;
+    if (r.v === 2) { if (r.rng !== undefined) return fail('v2 receipts have no rng field'); gen = 'mulberry32' }
+    else if (r.v === 3) { if (typeof r.rng !== 'string' || !generators[r.rng]) return fail('unknown generator ' + String(r.rng)); gen = r.rng }
+    else return fail('unsupported receipt version ' + String(r.v));
     if (r.mint != null && !IND[r.mint]) return fail('unknown mint');
     if (!Array.isArray(r.log)) return fail('bad log');
     let S: RunState;
-    try { S = createRun(r.seed, r.mint ?? null) } catch (e) { return fail(String(e)) }
+    try { S = createRun(r.seed, r.mint ?? null, gen) } catch (e) { return fail('bad seed: ' + String((e as Error).message ?? e)) }
     const logIn = r.log;
     let p = 0, ticks = 0;
     const maxTicks = opts.maxTicks ?? 100000;
@@ -644,7 +683,9 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
   function makeView(S: RunState): View {
     const Lv = S.lv, M = S.m, L = lvl(S);
     const fair = S.phase === 'play' && has(S, 'vwap');
-    const strip = (c: Candle): Candle => (fair ? { ...c } : { ...c, f: 0 });
+    // Built field by field: a field added to engine state never reaches a client by accident.
+    const strip = (c: Candle): Candle => ({ o: c.o, h: c.h, l: c.l, c: c.c, f: fair ? c.f : 0, n: c.n });
+    const shop = S.phase === 'shop';
     const pos = Lv.pos
       ? { dir: Lv.pos.dir, entry: Lv.pos.entry, lev: Lv.pos.lev, ret: posValue(S) / Lv.pos.margin - 1, locked: apeLocked(S) }
       : null;
@@ -654,7 +695,7 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
       i: S.i,
       layers: LEVELS.length,
       level: {
-        tk: L.tk, lore: L.lore, rug: !!L.rug, fake: L.fake, hunter: !!L.hunter,
+        tk: L.tk, lore: L.lore, rug: !!L.rug, fakeChip: L.fake >= 0.3 ? L.fake : null, hunter: !!L.hunter,
         start: Lv.start, target: Lv.target, dur: Lv.dur, drop: Lv.drop, loan: Lv.loan, drained: Lv.drained,
       },
       left: Math.max(0, Lv.dur - (M.t - Lv.t0)),
@@ -662,10 +703,8 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
       fair,
       candles: Lv.candles.map(strip),
       cur: Lv.cur ? strip(Lv.cur) : null,
-      ma20: has(S, 'sniper') ? ma20(S) : null,
+      ma20: S.phase === 'play' && has(S, 'sniper') ? ma20(S) : null,
       feed: Lv.feed.map((f) => ({ text: f.text, flagged: flag && f.fake, mine: f.mine })),
-      cash: Lv.cash,
-      debt: Lv.debt,
       equity: equity(S),
       pos,
       ready: S.phase === 'play' && !Lv.pos && Lv.cash - Lv.debt >= Lv.target,
@@ -679,10 +718,10 @@ export function makeEngine(math: MathImpl = Math, mathId: string = 'native') {
       credits: S.credits,
       bagMult: S.bagMult,
       whaleMult: S.whaleMult,
-      offers: S.offers.map((o) => ({ ...o })),
-      clear: S.clear ? { ...S.clear } : null,
+      offers: shop ? S.offers.map((o) => ({ id: o.id, sold: o.sold, con: o.con })) : [],
+      clear: shop && S.clear ? { bank: S.clear.bank, target: S.clear.target, a: S.clear.a, b: S.clear.b, c: S.clear.c } : null,
       end: S.phase === 'end'
-        ? { won: !!S.won, bank: S.bank, layers: result(S).layers, trades: S.trades, best: S.best, seed: S.seed }
+        ? { won: !!S.won, bank: S.bank, layers: result(S).layers, trades: S.trades, best: S.best, seed: S.seed, rng: S.gen }
         : null,
     };
   }
@@ -700,7 +739,10 @@ export interface View {
   i: number;
   layers: number;
   level: {
-    tk: string; lore: string; rug: boolean; fake: number; hunter: boolean;
+    tk: string; lore: string; rug: boolean;
+    /** Fake headline share, only when the intro shows it as a chip (30% or more). */
+    fakeChip: number | null;
+    hunter: boolean;
     start: number; target: number; dur: number; drop: number; loan: number; drained: string | null;
   };
   left: number;
@@ -711,8 +753,6 @@ export interface View {
   cur: Candle | null;
   ma20: number | null;
   feed: { text: string; flagged: boolean; mine: boolean }[];
-  cash: number;
-  debt: number;
   equity: number;
   pos: PosView | null;
   ready: boolean;
@@ -728,7 +768,7 @@ export interface View {
   whaleMult: number;
   offers: Offer[];
   clear: ClearInfo | null;
-  end: { won: boolean; bank: number; layers: number; trades: number; best: number; seed: number } | null;
+  end: { won: boolean; bank: number; layers: number; trades: number; best: number; seed: Seed; rng: string } | null;
 }
 
 export type Engine = ReturnType<typeof makeEngine>;

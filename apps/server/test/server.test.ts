@@ -8,6 +8,7 @@ import { startServer, type RunServer } from '../src/server.ts';
 import { verifyRanked } from '../src/verify.ts';
 import { utcDay } from '../src/seeds.ts';
 import { runExit } from '../src/exit-run.ts';
+import { headlineType } from '../src/headlines.ts';
 
 const NOON = Date.UTC(2026, 10, 12, 12);
 let offset = 0;
@@ -43,10 +44,10 @@ class Client {
   close(): void { this.ws.close() }
 }
 
-async function hello(name: string, token?: string, lite = true): Promise<{ c: Client; welcome: Extract<ServerMsg, { t: 'welcome' }> }> {
+async function hello(name: string, token?: string, lite = true, resume = false): Promise<{ c: Client; welcome: Extract<ServerMsg, { t: 'welcome' }> }> {
   const c = new Client(srv.url);
   await c.open();
-  c.send({ t: 'hello', v: PROTOCOL_VERSION, name, token, lite });
+  c.send({ t: 'hello', v: PROTOCOL_VERSION, name, token, lite, resume });
   const welcome = await c.next('welcome');
   return { c, welcome };
 }
@@ -68,7 +69,7 @@ async function playOut(c: Client, opts: { buyFirstOffer?: boolean } = {}): Promi
     } else if (m.t === 'tick' && 's' in m) {
       // headline trader: buy pump headlines, sell 50 ticks later, lock in when ready
       n = m.s.pos ? n + 1 : 0;
-      if (m.ev.some((e) => e.k === 'headline' && e.type === 'pump') && !m.s.pos) c.send({ t: 'press', b: 'buy' });
+      if (m.ev.some((e) => e.k === 'headline' && headlineType(e.text) === 'pump') && !m.s.pos) c.send({ t: 'press', b: 'buy' });
       else if (m.s.pos && n === 50) c.send({ t: 'press', b: 'sell' });
       else if (m.s.ready) c.send({ t: 'press', b: 'lock' });
     } else if (m.t === 'end') return { receipt: m.receipt, attestation: m.attestation, inds };
@@ -134,22 +135,6 @@ describe('run server', () => {
     d.c.close();
   });
 
-  it('a disconnect does not void the run: it plays out unattended and counts', async () => {
-    const day = utcDay(now());
-    const { c } = await hello('carol');
-    await c.next('snap');
-    c.send({ t: 'go' });
-    await c.next('tick', (m) => m.k >= 20);
-    c.close();
-    for (let k = 0; k < 100 && srv.liveCount(); k++) await new Promise((r) => setTimeout(r, 10));
-    expect(srv.liveCount()).toBe(0);
-    offset += 86_400_000;
-    const seed = await (await fetch(`${srv.url}/api/seed/${day}`)).json();
-    const pub = await (await fetch(`${srv.url}/api/runs/${day}`)).json();
-    expect(pub.runs).toHaveLength(1);
-    expect(verifyRanked({ ...pub.runs[0], dailySeed: seed.seed, signer: srv.signer }).ok).toBe(true);
-  });
-
   it('mints only an indicator held at run end, once per run, and the next run starts with it', async () => {
     await srv.close();
     srv = await startServer({ dbPath: join(dir, 'db2.sqlite'), tickMs: 3, attemptsPerDay: 2, idleMs: 0, maxMsgsPerSec: 500, now, log: () => {} });
@@ -203,5 +188,98 @@ describe('M1 exit harness (small)', () => {
     expect(s.botMismatches).toBe(0);
     expect(s.verifierExit).toBe(0);
     expect(s.verifierSummary).toContain('24/24 runs verified');
+  });
+});
+
+describe('reconnect', () => {
+  const TICK = 5;
+  beforeEach(async () => {
+    await srv.close();
+    srv = await startServer({ dbPath: join(dir, 'rc.sqlite'), tickMs: TICK, attemptsPerDay: 3, idleMs: 400, maxMsgsPerSec: 500, now, log: () => {} });
+  });
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const runsToday = () => (srv.db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as { n: number }).n;
+
+  it('the run keeps going while the player is away, and resumes from a full snapshot', async () => {
+    const day = utcDay(now());
+    const a = await hello('frank', undefined, false);
+    await a.c.next('snap');
+    a.c.send({ t: 'go' });
+    const before = await a.c.next('tick', (m) => m.k >= 15);
+    a.c.send({ t: 'press', b: 'buy' }); // an input before the drop
+    await a.c.next('snap', (m) => !!m.v.pos);
+    a.c.close();
+    const away = 200;
+    const t0 = Date.now();
+    await sleep(away);
+    const b = await hello('frank', a.welcome.token, false, true);
+    expect(b.welcome.resumed).toBe(true);
+    expect(b.welcome.attempt).toBe(1);
+    const snap = await b.c.next('snap');
+    const elapsedTicks = (Date.now() - t0) / TICK;
+    const k = snap.v.level.dur - snap.v.left;
+    // the clock did not pause: about away/TICK ticks passed (timers are coarse, so allow slack)
+    expect(k - before.k).toBeGreaterThan((away / TICK) * 0.6);
+    expect(k - before.k).toBeLessThanOrEqual(elapsedTicks + 5);
+    // full snapshot: the whole chart history and the open position
+    expect(snap.v.candles.length).toBeGreaterThan(40);
+    expect(snap.v.pos).not.toBeNull();
+    // and it is live: ticks keep arriving, inputs after the resume count
+    const t1 = await b.c.next('tick', (m) => 'v' in m && m.k > k);
+    expect(t1.k).toBeGreaterThan(k);
+    b.c.send({ t: 'press', b: 'sell' });
+    const r = await playOut(b.c);
+    expect(r.receipt.log.filter((e) => e[0] === 0 && e[1] >= 0).length).toBeGreaterThanOrEqual(2);
+    expect(runsToday()).toBe(1); // no extra attempt was used
+    offset += 86_400_000;
+    const seed = await (await fetch(`${srv.url}/api/seed/${day}`)).json();
+    expect(verifyRanked({ ...r, dailySeed: seed.seed, signer: srv.signer }).problems).toEqual([]);
+  });
+
+  it('a plain hello during a live run resumes it instead of starting a new attempt', async () => {
+    const a = await hello('gina');
+    await a.c.next('snap'); a.c.send({ t: 'go' }); await a.c.next('tick');
+    a.c.close();
+    const b = await hello('gina', a.welcome.token);
+    expect(b.welcome.resumed).toBe(true);
+    expect(b.welcome.attempt).toBe(1);
+    expect(runsToday()).toBe(1);
+    b.c.close();
+  });
+
+  it('resume with nothing to resume is refused and uses no attempt', async () => {
+    const a = await hello('hank');
+    await playOut(a.c); a.c.close();
+    await sleep(20);
+    const c = new Client(srv.url); await c.open();
+    c.send({ t: 'hello', v: PROTOCOL_VERSION, name: 'ivy', resume: true, lite: true });
+    expect((await c.next('error')).code).toBe('resume');
+    expect(runsToday()).toBe(1);
+  });
+
+  it('a second connection takes over the run and the first is told why', async () => {
+    const a = await hello('jack');
+    await a.c.next('snap'); a.c.send({ t: 'go' }); await a.c.next('tick');
+    const b = await hello('jack', a.welcome.token);
+    expect(b.welcome.resumed).toBe(true);
+    expect((await a.c.next('error')).code).toBe('replaced');
+    await b.c.next('tick');
+    b.c.close();
+  });
+
+  it('a run that ends while the player is away hands over its result on resume', async () => {
+    const a = await hello('kim');
+    await a.c.next('snap'); a.c.send({ t: 'go' }); await a.c.next('tick');
+    a.c.close();
+    for (let k = 0; k < 400 && srv.liveCount(); k++) await sleep(25); // plays out (level timeout, then idle in the shop)
+    expect(srv.liveCount()).toBe(0);
+    const b = await hello('kim', a.welcome.token, true, true);
+    expect(b.welcome.resumed).toBe(true);
+    const snap = await b.c.next('snap');
+    expect(snap.v.phase).toBe('end');
+    const end = await b.c.next('end');
+    const row = srv.db.run(end.run)!;
+    expect(row.receipt_json).toBe(JSON.stringify(end.receipt));
+    b.c.close();
   });
 });

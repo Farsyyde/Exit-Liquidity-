@@ -10,7 +10,7 @@ const seedBytes = parseSeedHex(SEED);
 function makeRun(player = 7, attempt = 1, native = false) {
   const eng = native ? nativeEngine : engine;
   const seed = runSeedOf(seedBytes, player, attempt);
-  const S = eng.createRun(seed, 'insider');
+  const S = eng.createRun(seed, 'insider', 'xoshiro256ss');
   eng.applyInput(S, 'go');
   let k = 0;
   while (S.phase !== 'end') {
@@ -32,8 +32,8 @@ describe('seeds', () => {
     expect(runSeedOf(seedBytes, 1, 1)).toBe(a);
     expect(runSeedOf(seedBytes, 2, 1)).not.toBe(a);
     expect(runSeedOf(seedBytes, 1, 2)).not.toBe(a);
-    expect(a).toBeGreaterThanOrEqual(0);
-    expect(a).toBeLessThan(2 ** 32);
+    expect(a).toMatch(/^0x[0-9a-f]{64}$/); // the full hash, nothing truncated
+    expect(a).toBe(keccakHex(new Uint8Array([...seedBytes, ...new Uint8Array(31), 1, ...new Uint8Array(31), 1])));
   });
   it('commit is keccak256 of the seed bytes', () => {
     // keccak256 of 32 bytes of 0x11, independently known value
@@ -74,6 +74,12 @@ describe('verifier', () => {
     expect(verifyRanked({ ...base, signer: other.publicHex }).ok).toBe(false);
     const att = { ...good.attestation, result: { ...good.attestation.result, layers: 8 } };
     expect(verifyRanked({ ...base, attestation: att }).ok).toBe(false);
+  });
+  it('rejects ranked receipts on the practice generator', () => {
+    const r = structuredClone(good.receipt); r.rng = 'mulberry32';
+    expect(verifyRanked({ ...base, receipt: r, attestation: null }).problems.join()).toMatch(/xoshiro256ss/);
+    const v2 = structuredClone(good.receipt) as any; v2.v = 2; delete v2.rng;
+    expect(verifyRanked({ ...base, receipt: v2, attestation: null }).ok).toBe(false);
   });
   it('rejects ranked receipts made with host math', () => {
     const nat = makeRun(7, 1, true);

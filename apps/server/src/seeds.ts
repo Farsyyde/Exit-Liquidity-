@@ -28,18 +28,21 @@ function uint256(n: number): Uint8Array {
 }
 
 /**
- * runSeed = uint32(keccak256(dailySeed ++ uint256(player) ++ uint256(attempt))),
- * that is the low 32 bits of the hash, as Solidity's uint32(uint256(h)) would give.
+ * runSeed = keccak256(dailySeed ++ uint256(player) ++ uint256(attempt)), all 32
+ * bytes, as 0x-prefixed lowercase hex. It seeds xoshiro256** directly (the four
+ * state words are the hash read as big-endian uint64s), so no bits are thrown away.
  * The player id stands in for the pass id until passes exist (M2).
  */
-export function runSeedOf(dailySeed: Uint8Array, player: number, attempt: number): number {
+export function runSeedOf(dailySeed: Uint8Array, player: number, attempt: number): string {
   const buf = new Uint8Array(96);
   buf.set(dailySeed, 0);
   buf.set(uint256(player), 32);
   buf.set(uint256(attempt), 64);
-  const h = keccak_256(buf);
-  return ((h[28]! << 24) | (h[29]! << 16) | (h[30]! << 8) | h[31]!) >>> 0;
+  return '0x' + bytesToHex(keccak_256(buf));
 }
+
+/** Generator used by every ranked run. */
+export const RANKED_RNG = 'xoshiro256ss';
 
 /** UTC calendar day, YYYY-MM-DD. */
 export function utcDay(ms: number): string {
