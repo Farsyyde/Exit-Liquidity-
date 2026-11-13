@@ -15,6 +15,8 @@ const srv = await startServer({
   dbPath: env.EXITLIQ_DB ?? resolve(here, '../data/exitliq.db'),
   signerKeyPath: env.EXITLIQ_SIGNER_KEY ?? resolve(here, '../data/signer.pem'),
   attemptsPerDay: Number(env.EXITLIQ_ATTEMPTS ?? 3),
+  // For local testing only; real play is 100 ms per tick.
+  ...(env.EXITLIQ_TICK_MS ? { tickMs: Number(env.EXITLIQ_TICK_MS) } : {}),
   staticDir: existsSync(webDist) ? webDist : null,
   // M2, testnet only. Set EXITLIQ_DEPLOYMENT to contracts/deployments/46630.json to turn the pass on.
   pass: env.EXITLIQ_DEPLOYMENT

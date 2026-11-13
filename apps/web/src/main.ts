@@ -327,6 +327,7 @@ function showTitle(): void {
     (mint ? '<p><span class="chip y">MINTED</span>' + IND[mint.id]!.name + ' joins this run (' + mint.runs + ' left).</p>' : '') +
     '<div class="row"><button class="btn go" data-act="start" type="button">START RUN</button></div>' +
     (rankedUp ? '<div class="row"><button class="btn alt" data-act="ranked" type="button">RANKED RUN</button><button class="btn alt" data-act="board" type="button">LEADERBOARD</button></div>' : '') +
+    (passUp ? '<div class="row"><button class="btn alt" data-act="mypass" type="button">MY PASS (TESTNET)</button></div>' : '') +
     '<p class="eyebrow">KEYS: B BUY, S SELL, L LOCK IN, 1 AND 2 ITEMS</p>');
 }
 function showRankedEntry(msg?: string): void {
@@ -336,6 +337,7 @@ function showRankedEntry(msg?: string): void {
     '<p>The server holds today\'s seed and streams the chart. Your inputs are stamped with the tick they arrive on. Anyone can replay the receipt once the day\'s seed is revealed.</p>' +
     '<p><label for="rname">Name</label></p><input id="rname" maxlength="24" autocomplete="off" value="' + esc(id ? id.name : '') + '" style="font-family:var(--body);font-size:21px;padding:6px;border-radius:6px;border:2px solid var(--panel-edge);background:#0c1018;color:var(--cream);-webkit-user-select:text;user-select:text">' +
     (msg ? '<p style="color:var(--down)">' + esc(msg) + '</p>' : '') +
+    (boundPass ? '<p><span class="chip y">PASS #' + esc(boundPass) + '</span>This run will be bound to your pass, so you can settle it on chain. Your wallet signs once to prove you hold it. <button class="btn alt" data-act="unbind" type="button" style="font-size:10px;padding:4px 6px">UNBIND</button></p>' : '') +
     '<div class="row"><button class="btn alt" data-act="title" type="button">BACK</button><button class="btn go" data-act="enter" type="button">ENTER</button></div>' +
     (id ? '<div class="row"><button class="btn alt" data-act="mydata" type="button">MY DATA</button><button class="btn alt" data-act="delask" type="button">DELETE ACCOUNT</button></div>' : ''));
 }
@@ -435,11 +437,132 @@ function showEnd(): void {
     v.inds.forEach((id) => { h += cardHTML(id, '', 'mint') });
     h += '</div><p id="mintMsg" style="color:var(--dim)">Minting replaces any indicator you minted before.</p>';
   }
+  if (ranked && (drv as RemoteDriver | null)?.boundPass) h += '<div id="settleArea">' + settleAreaHtml() + '</div>';
   h += '<div class="row"><button class="btn alt" data-act="copy" type="button">COPY RUN RECEIPT</button>' +
     '<button class="btn go" data-act="' + (ranked ? 'title' : 'start') + '" type="button">' + (ranked ? 'DONE' : 'NEW RUN') + '</button></div>' +
     '<p id="rcptMsg" class="eyebrow">THE RECEIPT IS THE SEED PLUS EVERY INPUT. IT IS WHAT A VERIFIER WOULD REPLAY.</p>' +
     '<textarea id="rcpt" readonly aria-label="Run receipt"></textarea>';
   show(h);
+}
+
+/* ---------- the pass (M2, testnet) ---------- */
+// The chain code (viem, @erc8426/client) loads only when MY PASS is opened.
+type ChainMod = typeof import('./chain.ts');
+let chainMod: ChainMod | null = null;
+let passWallet: import('./chain.ts').PassWallet | null = null;
+let passUp = false;
+let boundPass: string | null = null;
+const cards = new Map<string, { card: import('./chain.ts').Card; side: 'front' | 'back' }>();
+async function chainModule(): Promise<ChainMod> { return chainMod ??= await import('./chain.ts') }
+
+async function showMyPass(msg?: string, err?: boolean): Promise<void> {
+  screen = 'other';
+  show('<span class="eyebrow">TESTNET</span><h1>MY PASS</h1><p>Loading.</p>');
+  const m = await chainModule();
+  const info = passWallet?.info ?? (await m.chainInfo());
+  if (!info) { show('<h1>MY PASS</h1><p>Passes are not enabled on this server.</p><div class="row"><button class="btn alt" data-act="title" type="button">BACK</button></div>'); return }
+  let h = '<span class="eyebrow">' + esc(info.chainName.toUpperCase()) + ', TEST NETWORK ONLY</span><h1>MY PASS</h1>' +
+    '<p>A founder pass is a testnet NFT with no monetary value. It never expires. Ranked play stays free for everyone; a pass lets you settle your ranked results on chain and carry them on a wallet card.</p>' +
+    (msg ? '<p style="color:' + (err ? 'var(--down)' : 'var(--up)') + '">' + esc(msg) + '</p>' : '');
+  if (!passWallet?.address) {
+    h += (m.PassWallet.available()
+      ? '<div class="row"><button class="btn go" data-act="connect" type="button">CONNECT WALLET</button></div>'
+      : '<p style="color:var(--dim)">No browser wallet found. Install one, or open this page in a wallet app.</p>') +
+      '<div class="row"><button class="btn alt" data-act="title" type="button">BACK</button></div>';
+    show(h); return;
+  }
+  const w = passWallet;
+  const [list, mine] = await Promise.all([w.passes(), w.mintedBy()]);
+  const left = Math.max(0, info.maxPerWallet - mine);
+  h += '<div class="stat"><span>Wallet</span><span>' + esc(w.address!.slice(0, 6) + '...' + w.address!.slice(-4)) + '</span>' +
+    '<span>Founder passes</span><span>' + info.minted + ' of ' + info.supply + '</span><span>Price</span><span>' + esc(w.priceText()) + '</span>' +
+    '<span>Sale</span><span>' + esc(info.sale.replace('_', ' ')) + '</span><span>Styles</span><span>' + (info.revealed ? 'revealed' : 'revealed after the sale') + '</span></div>';
+  if (info.sale === 'open' && left > 0) {
+    h += '<h2>MINT (' + left + ' LEFT FOR THIS WALLET)</h2><div class="row">';
+    for (let q = 1; q <= left; q++) h += '<button class="btn go" data-act="passmint" data-q="' + q + '" type="button">' + q + '</button>';
+    h += '</div>';
+  }
+  h += '<h2>YOUR PASSES</h2>';
+  if (!list.length) h += '<p style="color:var(--dim)">None yet in this wallet.</p>';
+  for (const p of list) {
+    const c = cards.get(p.id);
+    h += '<div id="card-' + esc(p.id) + '">' + (c ? m.cardHtml(c.card, c.side) : '<div class="passcard" style="background:#2b2f38;color:#c9ced8"><div class="ptop"><span class="porg">EXIT LIQUIDITY</span><span>#' + esc(p.id) + '</span></div><p>Card locked. Your wallet signs to open it.</p></div>') + '</div>' +
+      '<div class="row"><button class="btn alt" data-act="passcard" data-id="' + esc(p.id) + '" type="button">' + (c ? 'REFRESH' : 'SHOW CARD') + '</button>' +
+      (c ? '<button class="btn alt" data-act="passback" data-id="' + esc(p.id) + '" type="button">FLIP</button>' : '') +
+      '<button class="btn alt" data-act="bindpass" data-id="' + esc(p.id) + '" type="button">PLAY RANKED</button></div>';
+  }
+  h += '<div class="row"><button class="btn alt" data-act="title" type="button">BACK</button></div>' +
+    '<p class="eyebrow">CONTRACT ' + esc(info.playPass) + '</p>';
+  show(h);
+}
+
+async function connectWallet(): Promise<void> {
+  try {
+    const m = await chainModule();
+    const info = await m.chainInfo();
+    if (!info) throw new Error('Passes are not enabled on this server.');
+    passWallet = new m.PassWallet(info);
+    await passWallet.connect();
+    await showMyPass();
+  } catch (e) { await showMyPass((e as Error).message, true) }
+}
+
+async function doMint(q: number): Promise<void> {
+  if (!passWallet) return;
+  show('<h1>MINTING</h1><p>Confirm in your wallet, then wait for the transaction.</p>');
+  try {
+    await passWallet.mint(q);
+    // the server indexes the mint within a few seconds
+    for (let k = 0; k < 10 && (await passWallet.passes()).length === 0; k++) await new Promise((r) => setTimeout(r, 1000));
+    passWallet = new (await chainModule()).PassWallet((await (await chainModule()).chainInfo())!).adopt(passWallet);
+    await showMyPass('Minted ' + q + '.');
+  } catch (e) { await showMyPass((e as Error).message, true) }
+}
+
+async function showCard(id: string, side: 'front' | 'back'): Promise<void> {
+  if (!passWallet) return;
+  const el = document.getElementById('card-' + id);
+  if (el) el.innerHTML = '<p>Sign in your wallet to open the card.</p>';
+  try {
+    cards.set(id, { card: await passWallet.card(id), side });
+    await showMyPass();
+  } catch (e) { await showMyPass((e as Error).message, true) }
+}
+
+async function flipCard(id: string): Promise<void> {
+  const c = cards.get(id);
+  if (!c) return;
+  c.side = c.side === 'front' ? 'back' : 'front';
+  const el = document.getElementById('card-' + id);
+  if (el) el.innerHTML = (await chainModule()).cardHtml(c.card, c.side);
+}
+
+function settleAreaHtml(): string {
+  const d = drv as RemoteDriver | null;
+  if (!d?.boundPass) return '';
+  if (!d.settlement) return '<p style="color:var(--dim)">Bound to pass #' + esc(d.boundPass) + '. Waiting for the server to sign the result.</p>';
+  return '<h2>SETTLE ON CHAIN</h2><p>Record this result for pass #' + esc(d.boundPass) + ' on ' + esc(passWallet?.info.chainName ?? 'the testnet') + '. Your wallet sends one transaction; you pay a small testnet gas fee.</p>' +
+    '<div class="row"><button class="btn go" data-act="settle" type="button">SETTLE ON CHAIN</button></div>';
+}
+function refreshSettleArea(): void { const el = document.getElementById('settleArea'); if (el) el.innerHTML = settleAreaHtml() }
+
+async function doSettle(): Promise<void> {
+  const d = drv as RemoteDriver | null;
+  const el = document.getElementById('settleArea');
+  if (!d?.settlement || !passWallet || !el) return;
+  el.innerHTML = '<p>Confirm in your wallet, then wait for the transaction.</p>';
+  try {
+    const hash = await passWallet.settle(d.settlement);
+    const link = passWallet.explorerTx(hash);
+    el.innerHTML = '<p style="color:var(--up)">Settled on chain.' + (link ? ' <a href="' + esc(link) + '" target="_blank" rel="noreferrer" style="color:var(--blue)">View transaction</a>' : '') + '</p><p>Updating your card. Your wallet signs once more to open it.</p>';
+    const id = d.boundPass!;
+    await new Promise((r) => setTimeout(r, 1500)); // let the server see the PassUpdate
+    const c = await passWallet.card(id);
+    cards.set(id, { card: c, side: 'front' });
+    el.innerHTML = '<p style="color:var(--up)">Settled on chain.' + (link ? ' <a href="' + esc(link) + '" target="_blank" rel="noreferrer" style="color:var(--blue)">View transaction</a>' : '') + '</p>' + (await chainModule()).cardHtml(c);
+  } catch (e) {
+    el.innerHTML = '<p style="color:var(--down)">' + esc((e as Error).message.split('\n')[0]!) + '</p>' + settleAreaHtml();
+  }
 }
 
 function newPractice(): void {
@@ -461,6 +584,14 @@ md.addEventListener('click', (e) => {
   else if (act === 'title') { if (drv) { drv.close(); drv = null } ranked = false; attract = new LocalDriver({ seed: rndSeed(), mint: null, attract: true, native: NATIVE }); vlo = vhi = null; renderNews(); renderInds(); renderCons(); showTitle() }
   else if (act === 'ranked') showRankedEntry();
   else if (act === 'board') void showBoard();
+  else if (act === 'mypass') void showMyPass();
+  else if (act === 'connect') void connectWallet();
+  else if (act === 'passmint') void doMint(Number(b.dataset.q));
+  else if (act === 'passcard') void showCard(b.dataset.id!, 'front');
+  else if (act === 'passback') void flipCard(b.dataset.id!);
+  else if (act === 'bindpass') { boundPass = b.dataset.id ?? null; showRankedEntry() }
+  else if (act === 'unbind') { boundPass = null; showRankedEntry() }
+  else if (act === 'settle') void doSettle();
   else if (act === 'mydata') {
     const id = loadIdentity();
     if (id) void accountRequest('export', id).then((r) => {
@@ -480,6 +611,14 @@ md.addEventListener('click', (e) => {
   } else if (act === 'enter') {
     const name = (($('rname') as HTMLInputElement).value || '').trim();
     if (!/^[A-Za-z0-9 _.-]{2,24}$/.test(name)) { showRankedEntry('Use 2 to 24 letters, numbers, spaces, dots, dashes or underscores.'); return }
+    if (boundPass && passWallet) {
+      show('<h1>SIGN IN YOUR WALLET</h1><p>Your wallet asks you to sign a message proving you hold pass #' + esc(boundPass) + '. Signing costs nothing.</p>');
+      void passWallet.bindProof(boundPass)
+        .then((proof) => { show('<h1>CONNECTING</h1><p>Asking the run server for a chart.</p>'); return RemoteDriver.connect(name, proof) })
+        .then((d) => { saveIdentity(d.identity); d.onSettlement = refreshSettleArea; startRun(d) })
+        .catch((err: Error) => showRankedEntry(err.message));
+      return;
+    }
     show('<h1>CONNECTING</h1><p>Asking the run server for a chart.</p>');
     RemoteDriver.connect(name).then((d) => { saveIdentity(d.identity); startRun(d) }).catch((err: Error) => showRankedEntry(err.message));
   } else if (act === 'trade') drv?.go();
@@ -526,6 +665,7 @@ renderNews(); renderInds(); renderCons();
 showTitle();
 requestAnimationFrame(frame);
 void rankedAvailable().then((up) => { rankedUp = up; if (screen === 'title') showTitle() });
+void fetch('/api/chain').then((r) => { passUp = r.ok; if (passUp && screen === 'title') showTitle() }, () => {});
 
 // Test hook: lets a scripted browser step ticks deterministically (?manual).
 if (TEST) (window as any).__el = { get drv() { return drv }, step(n = 1) { for (let k = 0; k < n; k++) (drv as LocalDriver | null)?.step(); drv?.frame(0) } };

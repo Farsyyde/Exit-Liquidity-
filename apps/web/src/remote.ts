@@ -1,6 +1,6 @@
 import {
   MAX_CANDLES, PROTOCOL_VERSION,
-  type Button, type ClientMsg, type PublicEvent, type ServerMsg, type View, type RankedReceipt, type Attestation,
+  type Button, type ClientMsg, type Settlement, type PublicEvent, type ServerMsg, type View, type RankedReceipt, type Attestation,
 } from '@exit-liquidity/engine';
 import type { Driver } from './driver.ts';
 
@@ -61,26 +61,30 @@ export class RemoteDriver implements Driver {
   onStatus: (s: LinkStatus) => void = () => {};
   identity: Identity = { name: '', token: '' };
   private final: { receipt: RankedReceipt; attestation: Attestation } | null = null;
+  /** The pass this run is bound to, and once the run ends, the signed result to settle on chain. */
+  boundPass: string | null = null;
+  settlement: Settlement | null = null;
+  onSettlement: () => void = () => {};
   private closedByUs = false;
   private retry = 0;
   private lostAt = 0;
 
   private constructor(private ws: WebSocket) {}
 
-  static connect(name: string): Promise<RemoteDriver> {
+  static connect(name: string, pass?: { id: string; message: string; signature: string }): Promise<RemoteDriver> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(wsUrl());
       const d = new RemoteDriver(ws);
       const prev = loadIdentity();
       let settled = false;
-      ws.onopen = () => d.send({ t: 'hello', v: PROTOCOL_VERSION, name, token: prev && prev.name === name ? prev.token : undefined });
+      ws.onopen = () => d.send({ t: 'hello', v: PROTOCOL_VERSION, name, token: prev && prev.name === name ? prev.token : undefined, ...(pass ? { pass } : {}) });
       ws.onerror = () => { if (!settled) { settled = true; reject(new Error('Could not reach the run server.')) } };
       ws.onclose = () => { if (!settled) { settled = true; reject(new Error('The run server closed the connection.')) } else d.dropped() };
       ws.onmessage = (e) => {
         const m = JSON.parse(String(e.data)) as ServerMsg;
         if (!settled) {
           if (m.t === 'error') { settled = true; reject(new Error(m.msg)); ws.close(); return }
-          if (m.t === 'welcome') d.identity = { name: m.name, token: m.token };
+          if (m.t === 'welcome') { d.identity = { name: m.name, token: m.token }; d.boundPass = m.pass?.id ?? null }
           if (m.t === 'snap') { settled = true; d.handle(m); resolve(d); return }
         }
         d.handle(m);
@@ -129,6 +133,10 @@ export class RemoteDriver implements Driver {
       if (m.ev.length) this.onEvents(m.ev);
     } else if (m.t === 'end') {
       this.final = { receipt: m.receipt, attestation: m.attestation };
+    } else if (m.t === 'settlement') {
+      const { t: _t, run: _r, ...s } = m;
+      this.settlement = s;
+      this.onSettlement();
     }
   }
 

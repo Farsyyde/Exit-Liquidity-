@@ -400,6 +400,8 @@ export function createPassService(o: PassOptions) {
     ]);
     return {
       chainId: dep.chainId, chainName: chain.name, explorer: chain.blockExplorers?.default.url ?? null,
+      // what a wallet adds for this chain (wallets send transactions through their own RPC, never through /api/rpc)
+      walletRpcUrl: dep.chainId === 31337 ? rpcUrl : chain.rpcUrls.default.http[0],
       playPass: dep.playPass, runRegistry: dep.runRegistry, price: price.toString(), paymentToken,
       sale: ['not_started', 'open', 'closed'][sale] ?? 'unknown', minted: Number(minted), supply: Number(supply),
       maxPerWallet: Number(maxPerWallet), revealed,

@@ -26,8 +26,15 @@ const SECRETS = [
 // 32 byte hex values could be a private key. Public constants that ship in
 // libraries (hash constants, the zero hash) are allowed by exact value.
 const HEX32 = /0x[0-9a-fA-F]{64}(?![0-9a-fA-F])/g;
+// Each was traced to its source (2026-11-13); add a value only after doing the same.
 const PUBLIC_HEX32 = new Set([
-  '0x0000000000000000000000000000000000000000000000000000000000000000',
+  '0x0000000000000000000000000000000000000000000000000000000000000000', // zero hash
+  '0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141', // secp256k1 group order n (@noble/curves)
+  '0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f', // secp256k1 field prime p (@noble/curves)
+  '0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee', // secp256k1 endomorphism beta (@noble/curves)
+  '0x6492649264926492649264926492649264926492649264926492649264926492', // ERC-6492 magic suffix (viem)
+  '0x8010801080108010801080108010801080108010801080108010801080108010', // ERC-8010 magic suffix (viem)
+  '0x5792579257925792579257925792579257925792579257925792579257925792', // EIP-5792 fallback call id (viem sendCalls)
 ]);
 
 function files(dir) {

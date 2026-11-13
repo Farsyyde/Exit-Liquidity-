@@ -133,16 +133,15 @@ Attempts per pass per day are capped (suggest 1 for tournaments, more for casual
 5. Who can challenge a result and what happens to the operator if the server signed a bad one.
 6. Relayer and gas sponsorship so players do not need ETH for every settle.
 
-## 12. UNVERIFIED, confirm before relying on these
+## 12. Verified 2026-11-13 (was: UNVERIFIED)
 
-Collected from search result summaries, not from reading the EIP or the SDK source:
+Checked against the ERC-8426 text (ethereum/ERCs `ERCS/erc-8426.md`), the SDK source at `github.com/huntclubhero/erc8426-sdk` (commit faf0cb2) and docs.robinhood.com/chain. Details in `docs/M2-pass.md`.
 
-- ERC-8426 is "Wallet Pass Extension for NFTs", Draft status, requires ERC-165, 721, 1271, 4361, 6492.
-- A conforming contract exposes `passURI` (like `tokenURI`, pointing at a pass manifest) and answers `supportsInterface(0xef5f1e71)`.
-- Events `PassUpdate` and `BatchPassUpdate` signal that a pass should refresh.
-- Gated manifests return 401 until the caller presents an ERC-4361 (Sign-In with Ethereum) challenge signed by the current owner. A transfer invalidates the previous owner's pass links.
-- An optional issuer commitment interface exists (`IERC721WalletPassIssuer`, ERC-165 id `0x470be7e9`).
-- SDK: npm scope `@erc8426`, MIT, source at `github.com/huntclubhero/erc8426-sdk`, with contracts, issuer, Apple and Google delivery, client, React, and a conformance suite (`npx @erc8426/conformance`).
-- Robinhood Chain appears as `eip155:4663` in one implementation's manifest paths. Confirm the mainnet and testnet chain ids and RPC endpoints from official docs.
-
-First task for whoever picks this up: read `eips.ethereum.org/EIPS/eip-8426` and the SDK README, correct this section, and adjust `PlayPass.sol` and the pass issuer design to match.
+- Correct: ERC-8426 is "Wallet Pass Extension for NFTs", Draft, requires 165, 721, 1271, 4361, 6492.
+- Correct: `passURI(tokenId)` (reverts for an invalid token), `supportsInterface(0xef5f1e71)`, events `PassUpdate(uint256 indexed)` and `BatchPassUpdate(uint256, uint256)` with an inclusive range.
+- Refined: a gated manifest answers 401 `{ error: "proof_required", challenge }` and no URLs. The challenge must carry token (CAIP-19), action, single-use nonce, expiry, verifier and account; ERC-4361 is the RECOMMENDED serialization, not a requirement. Acquisition URLs rotate on an observed transfer or the new owner's first claim (not synchronously); in between, the fresh `ownerOf` read at `latest` is what refuses the previous owner.
+- Correct: optional `IERC721WalletPassIssuer`, `passIssuer()`, id `0x470be7e9`.
+- Correct: npm scope `@erc8426` (contracts 0.3.0, issuer, client, google, apple, react, conformance 0.4.0), MIT. Not in the summary: `createIssuer` refuses to start without at least one format provider.
+- Corrected: `eip155:4663` is Robinhood Chain **mainnet**. The **testnet is chain id 46630**, RPC `https://rpc.testnet.chain.robinhood.com`, explorer `https://explorer.testnet.chain.robinhood.com` (official docs; `eth_chainId` answers `0xb626`).
+- New, affects contracts: Robinhood Chain is an Arbitrum Nitro chain. `prevrandao` (and `block.difficulty`) is a **constant** there and must not be used for randomness, and `block.number` is an L1 estimate; L2 block numbers and hashes come from the ArbSys precompile at `0x64`.
+- Section 5 step 2 is superseded: ranked seeds are the full keccak hash into xoshiro256** (no truncation), and the result carries the bankroll in cents (`bankCents`), since a float cannot go on chain.

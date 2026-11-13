@@ -10,6 +10,8 @@ reference/           The original single-file prototype, unchanged. It is the ru
 scripts/             Golden recording, web parity test, bundling helpers.
 ```
 
+**Branch `m2-pass`** adds the M2 pass on Robinhood Chain testnet (contracts in `contracts/`, pass server, My pass page) and the privacy work (`docs/legal/`). See `docs/M2-pass.md`. Not deployed anywhere.
+
 ## Quick start
 
 Node 22 and pnpm 10.
