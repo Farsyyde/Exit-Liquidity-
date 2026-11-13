@@ -1,0 +1,31 @@
+{
+  "name": "exit-liquidity",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p packages/engine && tsc -p apps/server && tsc -p apps/web",
+    "golden:record": "node scripts/record-golden.mjs native && node scripts/record-golden.mjs fixed",
+    "dev:web": "pnpm --filter @exit-liquidity/web dev",
+    "build:web": "pnpm --filter @exit-liquidity/web build",
+    "server": "pnpm --filter @exit-liquidity/server start",
+    "verify": "pnpm --filter @exit-liquidity/server verify",
+    "parity": "node scripts/web-parity.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "0.24.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "better-sqlite3"
+    ]
+  }
+}
