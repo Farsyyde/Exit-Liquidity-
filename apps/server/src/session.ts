@@ -12,9 +12,10 @@ import {
 } from '@exit-liquidity/engine';
 import { performance } from 'node:perf_hooks';
 import { keccakHex, RANKED_RNG } from './seeds.ts';
+import type { Settlement } from '@exit-liquidity/engine';
 
 
-export interface SessionInfo { run: number; player: number; day: string; attempt: number; seed: string; mint: string | null }
+export interface SessionInfo { run: number; player: number; day: string; attempt: number; seed: string; mint: string | null; pass?: { id: string; attempt: number } | null }
 
 export type Sender = (m: ServerMsg) => void;
 
@@ -31,6 +32,8 @@ export class RunSession {
   readonly S: RunState;
   done = false;
   ended: { receipt: RankedReceipt; attestation: Attestation } | null = null;
+  /** EIP-712 result for RunRegistry.settle, for a run bound to a pass. Set by the server after the end. */
+  settlement: Settlement | null = null;
   private timer: NodeJS.Timeout | null = null;
   private immediate: NodeJS.Immediate | null = null;
   private nextAt = 0;
@@ -55,7 +58,11 @@ export class RunSession {
     this.lite = lite;
     this.snap([]);
     if (this.ended) send({ t: 'end', run: this.info.run, receipt: this.ended.receipt, attestation: this.ended.attestation });
+    this.sendSettlement();
   }
+
+  /** Sends the settlement to the attached client, if both exist. */
+  sendSettlement(): void { if (this.settlement) this.send({ t: 'settlement', run: this.info.run, ...this.settlement }) }
 
   /** Stops the run without recording a result, because its owner deleted their account. */
   discard(): void {

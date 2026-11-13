@@ -21,7 +21,9 @@ export interface LiteState {
 
 export type ClientMsg =
   /** resume: only reattach to a run in progress (or just finished); never start a new attempt. */
-  | { t: 'hello'; v: number; name: string; token?: string; lite?: boolean; resume?: boolean }
+  | { t: 'hello'; v: number; name: string; token?: string; lite?: boolean; resume?: boolean;
+      /** Bind this run to a pass: a signed /api/pass-challenge message. Optional; ranked is free without one. */
+      pass?: { id: string; message: string; signature: string } }
   | { t: 'go' }
   | { t: 'next' }
   | { t: 'shop'; code: string }
@@ -29,7 +31,9 @@ export type ClientMsg =
   | { t: 'mint'; id: string };
 
 export type ServerMsg =
-  | { t: 'welcome'; name: string; player: number; token: string; day: string; attempt: number; attemptsLeft: number; commit: string; mint: string | null; resumed: boolean }
+  | { t: 'welcome'; name: string; player: number; token: string; day: string; attempt: number; attemptsLeft: number; commit: string; mint: string | null; resumed: boolean; pass?: { id: string; attempt: number } | null }
+  /** For a run bound to a pass, after `end`: what the pass owner submits to RunRegistry.settle. */
+  | ({ t: 'settlement'; run: number } & Settlement)
   /** Full view. Sent on phase changes and after every accepted input. */
   | { t: 'snap'; v: View; ev: PublicEvent[] }
   /** One tick. c is the candle that changed; closed means it just completed. */
@@ -40,6 +44,14 @@ export type ServerMsg =
   | { t: 'error'; code: string; msg: string };
 
 export interface RankedInfo { day: string; player: number; attempt: number }
+
+/** An EIP-712 RunResult signed by the run server. Integers that can pass 2^53 travel as strings. */
+export interface Settlement {
+  chainId: number;
+  registry: `0x${string}`;
+  result: { passId: string; day: number; attempt: number; receiptHash: `0x${string}`; layers: number; bankCents: string };
+  signature: `0x${string}`;
+}
 
 /** A ranked receipt is a plain receipt plus who, when and which attempt. */
 export interface RankedReceipt extends Receipt { ranked: RankedInfo }

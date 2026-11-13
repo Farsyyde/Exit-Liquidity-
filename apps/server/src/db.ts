@@ -36,6 +36,16 @@ CREATE TABLE IF NOT EXISTS runs (
   UNIQUE (player_id, day, attempt)
 );
 CREATE INDEX IF NOT EXISTS runs_day ON runs(day, status);
+CREATE TABLE IF NOT EXISTS kv (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL,
+  expires_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS pass_owners (
+  token_id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pass_owners_owner ON pass_owners(owner);
 CREATE TABLE IF NOT EXISTS mints (
   player_id INTEGER PRIMARY KEY REFERENCES players(id),
   ind TEXT NOT NULL,
@@ -54,6 +64,12 @@ export function openDb(path: string) {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  // M2 columns, added in place so a database from the live game keeps working.
+  const cols = new Set((db.prepare('PRAGMA table_info(runs)').all() as { name: string }[]).map((c) => c.name));
+  for (const [c, type] of [['pass_id', 'TEXT'], ['pass_attempt', 'INTEGER'], ['pass_owner', 'TEXT'], ['chain_json', 'TEXT']] as const) {
+    if (!cols.has(c)) db.exec(`ALTER TABLE runs ADD COLUMN ${c} ${type}`);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS runs_pass ON runs(pass_id, day)');
 
   const q = {
     playerByName: db.prepare('SELECT id, name, token_hash FROM players WHERE name = ?'),
@@ -132,6 +148,7 @@ export function openDb(path: string) {
       const again = q.seed.get(day) as { seed_hex: string; commit_hex: string };
       return { seedHex: again.seed_hex, commitHex: again.commit_hex };
     },
+    seedDays(): string[] { return (db.prepare('SELECT day FROM seeds ORDER BY day').all() as { day: string }[]).map((r) => r.day) },
     peekSeed(day: string): { seedHex: string; commitHex: string } | null {
       const row = q.seed.get(day) as { seed_hex: string; commit_hex: string } | undefined;
       return row ? { seedHex: row.seed_hex, commitHex: row.commit_hex } : null;
@@ -139,18 +156,67 @@ export function openDb(path: string) {
 
     attemptsUsed(player: number, day: string): number { return (q.attempts.get(player, day) as { n: number }).n },
 
-    /** Reserves the next attempt and consumes one minted charge, atomically. */
-    startRun: db.transaction((player: number, day: string, cap: number, seedOf: (attempt: number) => string, now: number) => {
+    /** Reserves the next attempt and consumes one minted charge, atomically. A run bound to a pass also takes the pass's next attempt. */
+    startRun: db.transaction((player: number, day: string, cap: number, seedOf: (attempt: number) => string, now: number, pass?: { id: string; owner: string }) => {
       const used = (q.attempts.get(player, day) as { n: number }).n;
       if (used >= cap) return null;
+      let passAttempt: number | null = null;
+      if (pass) {
+        const p = (db.prepare('SELECT COUNT(*) AS n FROM runs WHERE pass_id = ? AND day = ?').get(pass.id, day) as { n: number }).n;
+        if (p >= cap) return { passFull: true as const };
+        passAttempt = p + 1;
+      }
       const attempt = used + 1;
       const m = q.mint.get(player) as { ind: string; runs_left: number } | undefined;
       const mint = m && m.runs_left > 0 ? m.ind : null;
       if (mint) q.useMint.run(player);
       const seed = seedOf(attempt);
       const info = q.insertRun.run(player, day, attempt, seed, mint, now);
-      return { run: Number(info.lastInsertRowid), attempt, seed, mint, attemptsLeft: cap - attempt };
+      const run = Number(info.lastInsertRowid);
+      if (pass) db.prepare('UPDATE runs SET pass_id = ?, pass_attempt = ?, pass_owner = ? WHERE id = ?').run(pass.id, passAttempt, pass.owner.toLowerCase(), run);
+      return { passFull: false as const, run, attempt, seed, mint, attemptsLeft: cap - attempt, passAttempt };
     }),
+
+    setChainSettlement(run: number, json: string): void { db.prepare('UPDATE runs SET chain_json = ? WHERE id = ?').run(json, run) },
+    chainSettlement(run: number): string | null { return ((db.prepare('SELECT chain_json FROM runs WHERE id = ?').get(run) as { chain_json: string | null } | undefined)?.chain_json) ?? null },
+    passRunsPlayed(passId: string): number { return (db.prepare("SELECT COUNT(*) AS n FROM runs WHERE pass_id = ? AND status = 'done'").get(passId) as { n: number }).n },
+
+    setPassOwner(tokenId: string, owner: string): void {
+      db.prepare('INSERT INTO pass_owners (token_id, owner) VALUES (?, ?) ON CONFLICT(token_id) DO UPDATE SET owner = excluded.owner').run(tokenId, owner.toLowerCase());
+    },
+    passesOwnedBy(owner: string): string[] {
+      return (db.prepare('SELECT token_id FROM pass_owners WHERE owner = ? ORDER BY CAST(token_id AS INTEGER)').all(owner.toLowerCase()) as { token_id: string }[]).map((r) => r.token_id);
+    },
+
+    /** A KeyValueStore (the @erc8426/issuer interface) over SQLite. Single process, so getDel and incr are atomic. */
+    kv: (() => {
+      const live = (k: string) => {
+        const r = db.prepare('SELECT v, expires_ms FROM kv WHERE k = ?').get(k) as { v: string; expires_ms: number | null } | undefined;
+        if (!r) return null;
+        if (r.expires_ms !== null && r.expires_ms <= Date.now()) { db.prepare('DELETE FROM kv WHERE k = ?').run(k); return null }
+        return r.v;
+      };
+      const set = db.transaction((k: string, v: string, ttl?: number, onlyIfAbsent?: boolean) => {
+        if (onlyIfAbsent && live(k) !== null) return false;
+        db.prepare('INSERT INTO kv (k, v, expires_ms) VALUES (?, ?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v, expires_ms = excluded.expires_ms').run(k, v, ttl ? Date.now() + ttl * 1000 : null);
+        return true;
+      });
+      const getDel = db.transaction((k: string) => { const v = live(k); if (v !== null) db.prepare('DELETE FROM kv WHERE k = ?').run(k); return v });
+      const incr = db.transaction((k: string, ttl: number) => {
+        const v = live(k);
+        const n = (v === null ? 0 : Number(v)) + 1;
+        if (v === null) db.prepare('INSERT OR REPLACE INTO kv (k, v, expires_ms) VALUES (?, ?, ?)').run(k, String(n), Date.now() + ttl * 1000);
+        else db.prepare('UPDATE kv SET v = ? WHERE k = ?').run(String(n), k);
+        return n;
+      });
+      return {
+        async get(k: string) { return live(k) },
+        async set(k: string, v: string, o?: { ttlSeconds?: number; onlyIfAbsent?: boolean }) { return set(k, v, o?.ttlSeconds, o?.onlyIfAbsent) },
+        async getDel(k: string) { return getDel(k) },
+        async del(k: string) { db.prepare('DELETE FROM kv WHERE k = ?').run(k) },
+        async incr(k: string, ttlSeconds: number) { return incr(k, ttlSeconds) },
+      };
+    })(),
 
     finishRun(run: number, layers: number, bank: number, receiptJson: string, receiptHash: string, attestationJson: string, now: number): void {
       q.finishRun.run(layers, bank, receiptJson, receiptHash, attestationJson, now, run);

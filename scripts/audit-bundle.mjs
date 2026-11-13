@@ -11,7 +11,7 @@ const dist = resolve(process.argv[2] ?? 'apps/web/dist');
 
 // High confidence credential shapes. Any match fails the audit.
 const SECRETS = [
-  ['PEM private key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['PEM private key', /-{5}BEGIN [A-Z ]*PRIVATE KEY-{5}/],
   ['AWS access key', /\bAKIA[0-9A-Z]{16}\b/],
   ['Google API key', /\bAIza[0-9A-Za-z_-]{35}\b/],
   ['Google service account', /"type"\s*:\s*"service_account"|client_email[^,]{0,80}gserviceaccount\.com/],

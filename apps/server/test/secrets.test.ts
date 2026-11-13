@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { startServer } from '../src/server.ts';
@@ -71,6 +71,7 @@ describe('the repository holds no seeds, databases or keys', () => {
   });
   it('no tracked file is a SQLite database or holds a private key', () => {
     for (const f of tracked) {
+      if (!statSync(join(repo, f)).isFile()) continue; // a submodule (forge-std) is a directory entry
       const buf = readFileSync(join(repo, f));
       expect(buf.subarray(0, 15).toString('latin1') === 'SQLite format 3', f).toBe(false);
       expect(buf.includes('PRIVATE ' + 'KEY-----'), f).toBe(false); // split so this file does not match itself

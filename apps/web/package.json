@@ -9,9 +9,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@erc8426/client": "0.4.0",
+    "@erc8426/core": "0.4.0",
     "@exit-liquidity/engine": "workspace:*",
     "@fontsource/silkscreen": "5.1.0",
-    "@fontsource/vt323": "5.1.0"
+    "@fontsource/vt323": "5.1.0",
+    "viem": "2.40.3"
   },
   "devDependencies": {
     "vite": "^5.4.11"

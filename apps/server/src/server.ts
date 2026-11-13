@@ -11,6 +11,7 @@ import { openDb, type Db } from './db.ts';
 import { commitOf, runSeedOf, parseSeedHex, utcDay } from './seeds.ts';
 import { loadOrCreateSigner, type Signer } from './sign.ts';
 import { RunSession } from './session.ts';
+import type { PassService } from './pass.ts';
 
 export interface ServerOptions {
   port?: number;
@@ -30,6 +31,10 @@ export interface ServerOptions {
   resumeKeepMs?: number;
   /** Messages a connection may send per second before it is dropped. */
   maxMsgsPerSec?: number;
+  /** M2 pass features (issuer, binding, settlement). Absent: the server is exactly the M1 run server. */
+  pass?: PassService | ((db: Db) => PassService) | null;
+  /** How often the seed operator job runs when the pass is enabled. 0 turns it off. */
+  seedJobMs?: number;
   /** Wall clock for UTC days and timestamps. Tick timing never uses it. */
   now?: () => number;
   log?: (msg: string) => void;
@@ -50,6 +55,7 @@ export async function startServer(o: ServerOptions = {}) {
   const maxMsgs = o.maxMsgsPerSec ?? 40;
   const db: Db = openDb(o.dbPath ?? ':memory:');
   const signer: Signer = loadOrCreateSigner(o.signerKeyPath ?? null);
+  const passSvc: PassService | null = typeof o.pass === 'function' ? o.pass(db) : (o.pass ?? null);
   const voided = db.voidLiveRuns(now());
   if (voided) log(`voided ${voided} runs left live by a previous process`);
   /** Runs in progress, by player. One per player at a time. */
@@ -126,6 +132,28 @@ export async function startServer(o: ServerOptions = {}) {
     const p = url.pathname;
     const today = utcDay(now());
     try {
+      if (passSvc && (p === '/wallet-pass' || p.startsWith('/wallet-pass/'))) { passSvc.handleNode(req, res); return }
+      if (passSvc && req.method === 'POST' && p === '/api/rpc') {
+        void readBody(req, 65536).then(async (b) => {
+          if (b === null) return json(res, 413, { error: 'body too large' });
+          const r = await passSvc!.rpcProxy(b);
+          res.writeHead(r.status, { 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(r.body);
+        }).catch(() => json(res, 502, { error: 'rpc unavailable' }));
+        return;
+      }
+      if (passSvc && req.method === 'GET' && p === '/api/chain') {
+        void passSvc.saleInfo().then((i) => json(res, 200, i), () => json(res, 503, { error: 'chain read failed' }));
+        return;
+      }
+      if (passSvc && req.method === 'GET' && p.startsWith('/api/passes/')) {
+        void passSvc.passesOf(p.slice('/api/passes/'.length)).then((l) => json(res, 200, { passes: l }), () => json(res, 503, { error: 'chain read failed' }));
+        return;
+      }
+      if (passSvc && req.method === 'GET' && p === '/api/pass-challenge') {
+        void passSvc.rankedChallenge(url.searchParams.get('pass') ?? '', url.searchParams.get('address') ?? '')
+          .then((message) => json(res, 200, { message }), () => json(res, 400, { error: 'bad pass id or address' }));
+        return;
+      }
       if (req.method === 'POST' && (p === '/api/account/export' || p === '/api/account/delete')) {
         void accountRoute(req, res, p.endsWith('export') ? 'export' : 'delete').catch((e) => { log('account error ' + String(e)); json(res, 500, { error: 'internal' }) });
         return;
@@ -189,6 +217,7 @@ export async function startServer(o: ServerOptions = {}) {
   wss.on('connection', (ws: WebSocket) => {
     let session: RunSession | null = null;
     let player: { id: number; name: string } | null = null;
+    let helloPending = false;
     let windowStart = now(), count = 0;
     const send = (m: ServerMsg) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(m)) };
     const conn: Conn = { ws, send };
@@ -202,6 +231,7 @@ export async function startServer(o: ServerOptions = {}) {
       try { m = JSON.parse(String(data)) } catch { return fail('bad', 'Bad message.') }
       if (!m || typeof m !== 'object' || typeof (m as { t?: unknown }).t !== 'string') return fail('bad', 'Bad message.');
 
+      if (helloPending) return; // a pass check is in flight; the client waits for the snapshot anyway
       if (!session) {
         if (m.t !== 'hello' || player) return fail('bad', 'Say hello first.');
         if (m.v !== PROTOCOL_VERSION) return fail('version', 'Client is out of date. Reload the page.');
@@ -223,27 +253,52 @@ export async function startServer(o: ServerOptions = {}) {
         }
         if (m.resume) return fail('resume', 'There is no ranked run to resume.');
 
-        const day = utcDay(t);
-        const { seed, commit } = daySeed(day);
-        const started = db.startRun(player.id, day, cap, (attempt) => runSeedOf(seed, player!.id, attempt), t);
-        if (!started) return fail('attempts', `No ranked attempts left today (${cap} per day). Practice is unlimited.`);
-        send({ t: 'welcome', name: player.name, player: player.id, token: login.token, day, attempt: started.attempt, attemptsLeft: started.attemptsLeft, commit, mint: started.mint, resumed: false });
-        const s = new RunSession(
-          { run: started.run, player: player.id, day, attempt: started.attempt, seed: started.seed, mint: started.mint },
-          {
-            signer: signer.publicHex,
-            sign: (msg) => signer.sign(msg),
-            finish: (fs, receipt, att) => {
-              live.delete(fs.info.player);
-              recent.set(fs.info.player, { s: fs, at: now() });
-              db.finishRun(fs.info.run, receipt.result.layers, receipt.result.bank, JSON.stringify(receipt), att.receiptHash, JSON.stringify(att), now());
+        const who = player;
+        const bind = m.pass;
+        const startNew = (passBinding: { id: string; owner: string } | undefined) => {
+          if (ws.readyState !== ws.OPEN) return;
+          const day = utcDay(now());
+          const { seed, commit } = daySeed(day);
+          const started = db.startRun(who.id, day, cap, (attempt) => runSeedOf(seed, who.id, attempt), now(), passBinding);
+          if (!started) return fail('attempts', `No ranked attempts left today (${cap} per day). Practice is unlimited.`);
+          if (started.passFull) return fail('pass_attempts', `This pass has used its ${cap} ranked attempts today. Play without it, or with another pass.`);
+          const passInfo = passBinding ? { id: passBinding.id, attempt: started.passAttempt! } : null;
+          send({ t: 'welcome', name: who.name, player: who.id, token: login.token, day, attempt: started.attempt, attemptsLeft: started.attemptsLeft, commit, mint: started.mint, resumed: false, pass: passInfo });
+          const s = new RunSession(
+            { run: started.run, player: who.id, day, attempt: started.attempt, seed: started.seed, mint: started.mint, pass: passInfo },
+            {
+              signer: signer.publicHex,
+              sign: (msg) => signer.sign(msg),
+              finish: (fs, receipt, att) => {
+                live.delete(fs.info.player);
+                recent.set(fs.info.player, { s: fs, at: now() });
+                db.finishRun(fs.info.run, receipt.result.layers, receipt.result.bank, JSON.stringify(receipt), att.receiptHash, JSON.stringify(att), now());
+                if (fs.info.pass && passSvc) {
+                  const p = fs.info.pass;
+                  // The pass owner submits this to RunRegistry.settle. Chain signing is async; the client gets it after `end`.
+                  void passSvc.signRunResult({ passId: p.id, day: fs.info.day, attempt: p.attempt, receiptHash: att.receiptHash as `0x${string}`, layers: receipt.result.layers, bank: receipt.result.bank })
+                    .then((st) => { db.setChainSettlement(fs.info.run, JSON.stringify(st)); fs.settlement = st; fs.sendSettlement() })
+                    .catch((e: unknown) => log('settlement signing failed: ' + String(e)));
+                }
+              },
             },
-          },
-          { tickMs, idleMs },
-        );
-        live.set(player.id, s);
-        session = s;
-        attach(s, conn, lite);
+            { tickMs, idleMs },
+          );
+          live.set(who.id, s);
+          session = s;
+          attach(s, conn, lite);
+        };
+
+        if (!bind) { startNew(undefined); return }
+        // Bound to a pass: a signed proof of control and a fresh ownerOf read, before any attempt is used.
+        if (!passSvc) return fail('pass', 'Passes are not enabled on this server.');
+        if (typeof bind !== 'object' || typeof bind.id !== 'string' || typeof bind.message !== 'string' || typeof bind.signature !== 'string') return fail('pass', 'Bad pass proof.');
+        helloPending = true;
+        void passSvc.verifyBinding(bind.id, bind.message, bind.signature).then((v) => {
+          helloPending = false;
+          if ('error' in v) return fail('pass', v.error);
+          startNew({ id: bind.id, owner: v.owner });
+        }, (e: unknown) => { helloPending = false; log('pass binding failed: ' + String(e)); fail('pass', 'Could not check the pass. Try again.') });
         return;
       }
 
@@ -270,6 +325,19 @@ export async function startServer(o: ServerOptions = {}) {
     ws.on('error', () => { /* close follows */ });
   });
 
+  // The pass: follow chain logs, and commit and reveal daily seeds on chain when this server is the operator.
+  let seedTimer: NodeJS.Timeout | null = null;
+  const runSeedJob = async () => {
+    if (!passSvc) return;
+    try { await passSvc.seedJob((day) => { daySeed(day); return db.peekSeed(day)! }, () => db.seedDays()) }
+    catch (e) { log('seed job failed: ' + (e instanceof Error ? e.message.split('\n')[0] : String(e))) }
+  };
+  if (passSvc) {
+    passSvc.startIndexer();
+    const every = o.seedJobMs ?? 10 * 60_000;
+    if (every > 0) { void runSeedJob(); seedTimer = setInterval(() => void runSeedJob(), every) }
+  }
+
   await new Promise<void>((resolve) => http.listen(o.port ?? 0, o.host ?? '127.0.0.1', resolve));
   const addr = http.address();
   const port = typeof addr === 'object' && addr ? addr.port : 0;
@@ -280,9 +348,13 @@ export async function startServer(o: ServerOptions = {}) {
     signer: signer.publicHex,
     db,
     liveCount: () => live.size,
+    pass: passSvc,
+    runSeedJob,
     /** True while this player has a run in progress (attached or not). */
     hasLiveRun: (player: number) => live.has(player),
     async close(): Promise<void> {
+      if (seedTimer) clearInterval(seedTimer);
+      passSvc?.stop();
       for (const s of [...live.values()]) s.finishUnattended();
       for (const c of wss.clients) c.terminate();
       await new Promise<void>((r) => wss.close(() => r()));
