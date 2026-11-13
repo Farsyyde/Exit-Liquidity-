@@ -9,7 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@exit-liquidity/engine": "workspace:*"
+    "@exit-liquidity/engine": "workspace:*",
+    "@fontsource/silkscreen": "5.1.0",
+    "@fontsource/vt323": "5.1.0"
   },
   "devDependencies": {
     "vite": "^5.4.11"

@@ -73,7 +73,7 @@ describe('the repository holds no seeds, databases or keys', () => {
     for (const f of tracked) {
       const buf = readFileSync(join(repo, f));
       expect(buf.subarray(0, 15).toString('latin1') === 'SQLite format 3', f).toBe(false);
-      expect(buf.includes('PRIVATE KEY-----'), f).toBe(false);
+      expect(buf.includes('PRIVATE ' + 'KEY-----'), f).toBe(false); // split so this file does not match itself
     }
   });
   it('the default places the server writes seeds and keys are ignored by git', () => {

@@ -84,6 +84,34 @@ export function openDb(path: string) {
     raw: db,
     close: () => db.close(),
 
+    /** Checks a name and token without creating anything. */
+    authenticate(name: string, token: string): PlayerRow | null {
+      const row = q.playerByName.get(name) as PlayerRow | undefined;
+      if (!row || !token || hashToken(token) !== row.token_hash) return null;
+      return row;
+    },
+
+    /** Everything stored about one player, for a data export. */
+    accountData(player: number) {
+      const p = db.prepare('SELECT id, name, created_ms FROM players WHERE id = ?').get(player) as { id: number; name: string; created_ms: number } | undefined;
+      if (!p) return null;
+      const runs = db.prepare('SELECT id, day, attempt, status, layers, bank, mint, minted, started_ms, ended_ms, receipt_json FROM runs WHERE player_id = ? ORDER BY id').all(player) as Record<string, unknown>[];
+      const mint = db.prepare('SELECT ind, runs_left FROM mints WHERE player_id = ?').get(player) ?? null;
+      return {
+        player: { id: p.id, name: p.name, createdAt: new Date(p.created_ms).toISOString() },
+        mint,
+        runs: runs.map((r) => ({ ...r, receipt_json: undefined, receipt: r.receipt_json ? JSON.parse(String(r.receipt_json)) : null })),
+      };
+    },
+
+    /** Deletes a player and every row tied to them: runs (and so their leaderboard entries and published receipts), the minted indicator, the login. */
+    deleteAccount: db.transaction((player: number) => {
+      const runs = db.prepare('DELETE FROM runs WHERE player_id = ?').run(player).changes;
+      db.prepare('DELETE FROM mints WHERE player_id = ?').run(player);
+      const players = db.prepare('DELETE FROM players WHERE id = ?').run(player).changes;
+      return { runs, players };
+    }),
+
     /** Finds a player by name and checks the token, or creates the player. */
     login(name: string, token: string | undefined, now: number): { player: PlayerRow; token: string } | { error: string } {
       const row = q.playerByName.get(name) as PlayerRow | undefined;

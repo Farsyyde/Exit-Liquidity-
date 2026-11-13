@@ -57,6 +57,14 @@ export class RunSession {
     if (this.ended) send({ t: 'end', run: this.info.run, receipt: this.ended.receipt, attestation: this.ended.attestation });
   }
 
+  /** Stops the run without recording a result, because its owner deleted their account. */
+  discard(): void {
+    this.done = true;
+    this.stopClock();
+    this.disarmIdle();
+    this.sender = null;
+  }
+
   /** The client went away. Nothing else changes: the clock keeps running and the run plays on. */
   detach(): void { this.sender = null }
 

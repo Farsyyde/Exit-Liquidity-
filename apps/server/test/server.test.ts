@@ -283,3 +283,47 @@ describe('reconnect', () => {
     b.c.close();
   });
 });
+
+describe('account export and deletion', () => {
+  const post = (path: string, body: unknown) => fetch(srv.url + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+
+  it('exports what is stored and deletes every row tied to the player, including a live run', async () => {
+    const a = await hello('lena');
+    const token = a.welcome.token;
+    await playOut(a.c); a.c.close();
+    const b = await hello('lena', token); // a second run, left live
+    await b.c.next('snap');
+    expect(srv.liveCount()).toBe(1);
+    const other = await hello('mo'); await playOut(other.c); other.c.close();
+
+    const exp = await (await post('/api/account/export', { name: 'lena', token })).json();
+    expect(exp.player.name).toBe('lena');
+    expect(exp.runs).toHaveLength(2);
+    expect(JSON.stringify(exp)).not.toContain(token); // the token itself is never stored
+
+    // wrong token and unknown name get the same refusal
+    const wrong = await post('/api/account/delete', { name: 'lena', token: 'x'.repeat(32) });
+    const unknown = await post('/api/account/delete', { name: 'nobody', token: 'x'.repeat(32) });
+    expect(wrong.status).toBe(401); expect(unknown.status).toBe(401);
+    expect(await wrong.text()).toBe(await unknown.text());
+
+    const del = await (await post('/api/account/delete', { name: 'lena', token })).json();
+    expect(del).toEqual({ deleted: true, runs: 2 });
+    expect(srv.liveCount()).toBe(0);
+    const left = srv.db.raw.prepare('SELECT (SELECT COUNT(*) FROM players WHERE name = ?) AS p, (SELECT COUNT(*) FROM runs r JOIN players p ON p.id = r.player_id WHERE p.name = ?) AS r').get('lena', 'lena') as { p: number; r: number };
+    expect(left).toEqual({ p: 0, r: 0 });
+    const board = await (await fetch(srv.url + '/api/leaderboard')).json();
+    expect(board.rows.map((r: { name: string }) => r.name)).toEqual(['mo']);
+    // the name is free again, and the old token no longer works
+    expect((await post('/api/account/export', { name: 'lena', token })).status).toBe(401);
+    const again = await hello('lena');
+    expect(again.welcome.attempt).toBe(1);
+    again.c.close();
+  });
+
+  it('refuses malformed and oversized bodies', async () => {
+    expect((await fetch(srv.url + '/api/account/delete', { method: 'POST', body: 'nope' })).status).toBe(400);
+    expect((await post('/api/account/delete', { name: 'x', token: 'y'.repeat(5000) })).status).toBe(413);
+    expect((await fetch(srv.url + '/api/account/delete')).status).toBe(404); // only POST reaches it
+  });
+});

@@ -81,7 +81,7 @@ export async function startServer(o: ServerOptions = {}) {
     if (!o.staticDir) { json(res, 404, { error: 'not found' }); return }
     let p = normalize(path).replace(/^(\.\.[/\\])+/, '');
     if (p === '/' || p === '') p = '/index.html';
-    const types: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
+    const types: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.woff': 'font/woff', '.json': 'application/json' };
     try {
       const body = await readFile(join(o.staticDir, p));
       res.writeHead(200, { 'content-type': types[extname(p)] ?? 'application/octet-stream' });
@@ -90,11 +90,46 @@ export async function startServer(o: ServerOptions = {}) {
     void req;
   }
 
+  // ---------- account: export and delete (privacy) ----------
+
+  /** Reads a small body. Past the limit it keeps draining (so the client gets an answer) and resolves null. */
+  function readBody(req: IncomingMessage, limit = 4096): Promise<string | null> {
+    return new Promise((resolve, reject) => {
+      let size = 0; const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => { size += c.length; if (size <= limit) chunks.push(c) });
+      req.on('end', () => resolve(size > limit ? null : Buffer.concat(chunks).toString('utf8')));
+      req.on('error', reject);
+    });
+  }
+
+  async function accountRoute(req: IncomingMessage, res: ServerResponse, action: 'export' | 'delete'): Promise<void> {
+    let body: { name?: unknown; token?: unknown };
+    const raw = await readBody(req);
+    if (raw === null) return json(res, 413, { error: 'body too large' });
+    try { body = JSON.parse(raw) } catch { return json(res, 400, { error: 'bad request' }) }
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const token = typeof body.token === 'string' ? body.token : '';
+    const player = name && token ? db.authenticate(name, token) : null;
+    // Same answer for an unknown name and a wrong token, so names cannot be probed.
+    if (!player) return json(res, 401, { error: 'name and token do not match an account' });
+    if (action === 'export') return json(res, 200, db.accountData(player.id));
+    const s = live.get(player.id);
+    if (s) { attachedBy.get(s)?.ws.close(); attachedBy.delete(s); s.discard(); live.delete(player.id) }
+    recent.delete(player.id);
+    const out = db.deleteAccount(player.id);
+    log(`account deleted (${out.runs} runs)`);
+    return json(res, 200, { deleted: true, runs: out.runs });
+  }
+
   const http = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://x');
     const p = url.pathname;
     const today = utcDay(now());
     try {
+      if (req.method === 'POST' && (p === '/api/account/export' || p === '/api/account/delete')) {
+        void accountRoute(req, res, p.endsWith('export') ? 'export' : 'delete').catch((e) => { log('account error ' + String(e)); json(res, 500, { error: 'internal' }) });
+        return;
+      }
       if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' });
       if (p === '/api/health') return json(res, 200, { ok: true, day: today, protocol: PROTOCOL_VERSION, signer: signer.publicHex });
       if (p === '/api/leaderboard') {

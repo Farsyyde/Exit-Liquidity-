@@ -12,6 +12,15 @@ export function loadIdentity(): Identity | null {
   try { const v = JSON.parse(localStorage.getItem(ID_KEY) || 'null'); return v && typeof v.name === 'string' && typeof v.token === 'string' ? v : null } catch { return null }
 }
 export function saveIdentity(id: Identity): void { try { localStorage.setItem(ID_KEY, JSON.stringify(id)) } catch { /* private mode */ } }
+export function clearIdentity(): void { try { localStorage.removeItem(ID_KEY) } catch { /* private mode */ } }
+
+/** Data export or account deletion, authenticated by the name and token this browser holds. */
+export async function accountRequest(action: 'export' | 'delete', id: Identity): Promise<unknown> {
+  const r = await fetch('/api/account/' + action, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: id.name, token: id.token }) });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((body as { error?: string }).error ?? 'The run server refused (' + r.status + ').');
+  return body;
+}
 
 export async function rankedAvailable(): Promise<boolean> {
   try {

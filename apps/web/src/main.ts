@@ -2,10 +2,14 @@
 // reference/prototype.html. Game rules live in @exit-liquidity/engine; this
 // file only reads the public View and dispatches inputs through a Driver.
 
+// Fonts are self-hosted (SIL OFL): the page makes no third-party requests.
+import '@fontsource/silkscreen/latin-400.css';
+import '@fontsource/silkscreen/latin-700.css';
+import '@fontsource/vt323/latin-400.css';
 import { CON, CSLOTS, IND, LEVELS, fm, fp, type PublicEvent, type View } from '@exit-liquidity/engine';
 import type { Driver } from './driver.ts';
 import { LocalDriver } from './local.ts';
-import { RemoteDriver, rankedAvailable, loadIdentity, saveIdentity, fetchLeaderboard, type LinkStatus } from './remote.ts';
+import { RemoteDriver, rankedAvailable, loadIdentity, saveIdentity, clearIdentity, accountRequest, fetchLeaderboard, type LinkStatus } from './remote.ts';
 
 const MINT_KEY = 'exitliq_mint';
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
@@ -332,7 +336,18 @@ function showRankedEntry(msg?: string): void {
     '<p>The server holds today\'s seed and streams the chart. Your inputs are stamped with the tick they arrive on. Anyone can replay the receipt once the day\'s seed is revealed.</p>' +
     '<p><label for="rname">Name</label></p><input id="rname" maxlength="24" autocomplete="off" value="' + esc(id ? id.name : '') + '" style="font-family:var(--body);font-size:21px;padding:6px;border-radius:6px;border:2px solid var(--panel-edge);background:#0c1018;color:var(--cream);-webkit-user-select:text;user-select:text">' +
     (msg ? '<p style="color:var(--down)">' + esc(msg) + '</p>' : '') +
-    '<div class="row"><button class="btn alt" data-act="title" type="button">BACK</button><button class="btn go" data-act="enter" type="button">ENTER</button></div>');
+    '<div class="row"><button class="btn alt" data-act="title" type="button">BACK</button><button class="btn go" data-act="enter" type="button">ENTER</button></div>' +
+    (id ? '<div class="row"><button class="btn alt" data-act="mydata" type="button">MY DATA</button><button class="btn alt" data-act="delask" type="button">DELETE ACCOUNT</button></div>' : ''));
+}
+function showDeleteAsk(msg?: string): void {
+  screen = 'other';
+  const id = loadIdentity();
+  if (!id) { showRankedEntry(); return }
+  show('<span class="eyebrow">RANKED ACCOUNT</span><h1>DELETE ACCOUNT</h1>' +
+    '<p>This deletes <b>' + esc(id.name) + '</b> from the run server: the name, every ranked run and its receipt, its leaderboard entries and any minted indicator. It cannot be undone. Receipts other people already downloaded stay with them.</p>' +
+    '<p>Type the name to confirm.</p><input id="delname" maxlength="24" autocomplete="off" style="font-family:var(--body);font-size:21px;padding:6px;border-radius:6px;border:2px solid var(--panel-edge);background:#0c1018;color:var(--cream);-webkit-user-select:text;user-select:text">' +
+    (msg ? '<p style="color:var(--down)">' + esc(msg) + '</p>' : '') +
+    '<div class="row"><button class="btn alt" data-act="ranked" type="button">CANCEL</button><button class="btn sell" data-act="delgo" type="button">DELETE</button></div>');
 }
 async function showBoard(): Promise<void> {
   screen = 'other';
@@ -446,7 +461,23 @@ md.addEventListener('click', (e) => {
   else if (act === 'title') { if (drv) { drv.close(); drv = null } ranked = false; attract = new LocalDriver({ seed: rndSeed(), mint: null, attract: true, native: NATIVE }); vlo = vhi = null; renderNews(); renderInds(); renderCons(); showTitle() }
   else if (act === 'ranked') showRankedEntry();
   else if (act === 'board') void showBoard();
-  else if (act === 'enter') {
+  else if (act === 'mydata') {
+    const id = loadIdentity();
+    if (id) void accountRequest('export', id).then((r) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' }));
+      a.download = 'exit-liquidity-my-data.json'; a.click();
+    }).catch((err: Error) => showRankedEntry(err.message));
+  } else if (act === 'delask') showDeleteAsk();
+  else if (act === 'delgo') {
+    const id = loadIdentity();
+    const typed = (($('delname') as HTMLInputElement).value || '').trim();
+    if (!id || typed.toLowerCase() !== id.name.toLowerCase()) { showDeleteAsk('The name does not match.'); return }
+    void accountRequest('delete', id).then(() => {
+      clearIdentity();
+      show('<h1>DELETED</h1><p>Your ranked account and its runs are gone from the server. This browser has forgotten it too.</p><div class="row"><button class="btn alt" data-act="title" type="button">OK</button></div>');
+    }).catch((err: Error) => showDeleteAsk(err.message));
+  } else if (act === 'enter') {
     const name = (($('rname') as HTMLInputElement).value || '').trim();
     if (!/^[A-Za-z0-9 _.-]{2,24}$/.test(name)) { showRankedEntry('Use 2 to 24 letters, numbers, spaces, dots, dashes or underscores.'); return }
     show('<h1>CONNECTING</h1><p>Asking the run server for a chart.</p>');
