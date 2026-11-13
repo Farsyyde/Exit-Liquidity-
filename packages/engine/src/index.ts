@@ -12,3 +12,4 @@ export const engine = makeEngine(fixedMath, FIXED_MATH_ID);
 /** Engine on the host's Math, identical to the prototype in the same runtime. Receipts only replay in that runtime. */
 export const nativeEngine = makeEngine(Math, 'native');
 export * from './fixedmath.ts';
+export * from './protocol.ts';
