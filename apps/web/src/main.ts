@@ -9,6 +9,7 @@ import '@fontsource/vt323/latin-400.css';
 import { CON, CSLOTS, IND, LEVELS, fm, fp, type PublicEvent, type View } from '@exit-liquidity/engine';
 import type { Driver } from './driver.ts';
 import { LocalDriver } from './local.ts';
+import { authConfig, loadAuth, rememberSession, hadSession, meFetch, type AuthApi } from './auth/index.ts';
 import { RemoteDriver, rankedAvailable, loadIdentity, saveIdentity, clearIdentity, accountRequest, fetchLeaderboard, type LinkStatus } from './remote.ts';
 
 const MINT_KEY = 'exitliq_mint';
@@ -62,7 +63,12 @@ interface Mint { id: string; runs: number }
 function readMint(): Mint | null {
   try { const v = JSON.parse(localStorage.getItem(MINT_KEY) || 'null'); return v && IND[v.id] && v.runs > 0 ? v : null } catch { return null }
 }
-function writeMint(v: Mint): void { try { localStorage.setItem(MINT_KEY, JSON.stringify(v)) } catch { /* private mode */ } }
+function writeMintLocal(v: Mint | null): void { try { if (v) localStorage.setItem(MINT_KEY, JSON.stringify(v)); else localStorage.removeItem(MINT_KEY) } catch { /* private mode */ } }
+/** Guests keep the keepsake in this browser; a logged-in player's copy also goes to the account. */
+function writeMint(v: Mint): void {
+  writeMintLocal(v);
+  if (auth && account) void meFetch(auth, '/api/me/practice-mint', { mint: v.runs > 0 ? v : null }).catch(() => {});
+}
 
 /* ---------- events to juice ---------- */
 function onEvents(evs: PublicEvent[]): void {
@@ -328,10 +334,12 @@ function showTitle(): void {
     '<div class="row"><button class="btn go" data-act="start" type="button">START RUN</button></div>' +
     (rankedUp ? '<div class="row"><button class="btn alt" data-act="ranked" type="button">RANKED RUN</button><button class="btn alt" data-act="board" type="button">LEADERBOARD</button></div>' : '') +
     (passUp ? '<div class="row"><button class="btn alt" data-act="mypass" type="button">MY PASS (TESTNET)</button></div>' : '') +
+    (authCfg ? '<div class="row"><button class="btn alt" data-act="' + (account ? 'account' : 'login') + '" type="button">' + (account ? 'ACCOUNT: ' + esc(account.player?.name ?? auth?.state().email ?? 'LOGGED IN') : 'LOG IN (OPTIONAL)') + '</button></div>' : '') +
     '<p class="eyebrow">KEYS: B BUY, S SELL, L LOCK IN, 1 AND 2 ITEMS</p>');
 }
 function showRankedEntry(msg?: string): void {
   screen = 'other';
+  if (account) { showRankedAccount(msg); return }
   const id = loadIdentity();
   show('<span class="eyebrow">RANKED, SERVER PICKS THE CHART</span><h1>RANKED RUN</h1>' +
     '<p>The server holds today\'s seed and streams the chart. Your inputs are stamped with the tick they arrive on. Anyone can replay the receipt once the day\'s seed is revealed.</p>' +
@@ -565,6 +573,195 @@ async function doSettle(): Promise<void> {
   }
 }
 
+/* ---------- login (Privy), optional ---------- */
+// Guests never load Privy. Logging in keeps everything a guest has and moves
+// it into the account; ranked then runs on the Privy access token.
+interface Account { userId: string; player: { id: number; name: string } | null; practiceMint: Mint | null; canDeletePrivyUser: boolean }
+let authCfg: { appId: string; clientId: string | null } | null = null;
+let auth: AuthApi | null = null;
+let account: Account | null = null;
+let mintTo: string | null = null;
+const walletCache = new Map<string, import('./chain.ts').PassWallet>();
+const short = (a: string) => a.slice(0, 6) + '...' + a.slice(-4);
+const inputStyle = 'font-family:var(--body);font-size:21px;padding:6px;border-radius:6px;border:2px solid var(--panel-edge);background:#0c1018;color:var(--cream);-webkit-user-select:text;user-select:text';
+
+async function startAuth(interactive: boolean): Promise<void> {
+  if (!authCfg) return;
+  if (interactive) show('<h1>LOG IN</h1><p>Opening the login window.</p>');
+  auth = await loadAuth(authCfg);
+  auth.onChange((st) => { if (st.ready && !st.authenticated && account) { account = null; rememberSession(false); walletCache.clear(); if (screen === 'title') showTitle() } });
+  if (!auth.state().authenticated && interactive && !(await auth.login())) { showTitle(); return }
+  if (!auth.state().authenticated) { rememberSession(false); return }
+  await syncAccount();
+}
+
+/** First login moves the guest ranked name and the practice keepsake into the account; later logins just load it. */
+async function syncAccount(): Promise<void> {
+  if (!auth) return;
+  const r = await meFetch(auth, '/api/me', { guest: loadIdentity(), practiceMint: readMint() });
+  if (!r.ok) { showTitle(); return }
+  const me = (await r.json()) as Account & { adoptedGuest: boolean; guestKeptSeparate: boolean; created: boolean };
+  account = { userId: me.userId, player: me.player, practiceMint: me.practiceMint, canDeletePrivyUser: me.canDeletePrivyUser };
+  rememberSession(true);
+  if (me.adoptedGuest) clearIdentity(); // the guest token no longer plays that name; the account does
+  if (me.practiceMint) writeMintLocal(me.practiceMint);
+  if (me.created) showAccount(me.adoptedGuest ? 'Logged in. Your ranked name and runs moved into this account.' : 'Logged in.');
+  else if (screen === 'title' || screen === 'other') showTitle();
+}
+
+function walletRows(): string {
+  const st = auth?.state();
+  if (!st?.wallets.length) return '<p style="color:var(--dim)">No wallet linked yet.</p>';
+  return '<div class="stat">' + st.wallets.map((w) => '<span>' + esc(short(w.address)) + '</span><span>' + (w.embedded ? 'embedded' : esc(w.client ?? 'external')) + '</span>').join('') + '</div>';
+}
+
+function showAccount(msg?: string, err?: boolean): void {
+  screen = 'other';
+  const st = auth?.state();
+  if (!account || !st) { showTitle(); return }
+  show('<span class="eyebrow">ACCOUNT</span><h1>' + esc(account.player?.name ?? 'NO RANKED NAME YET') + '</h1>' +
+    (msg ? '<p style="color:' + (err ? 'var(--down)' : 'var(--up)') + '">' + esc(msg) + '</p>' : '') +
+    (st.email ? '<p>Logged in as ' + esc(st.email) + '.</p>' : '') +
+    (account.player ? '' : '<p><label for="aname">Choose a ranked name</label></p><input id="aname" maxlength="24" autocomplete="off" style="' + inputStyle + '"><div class="row"><button class="btn go" data-act="setname" type="button">SAVE NAME</button></div>') +
+    '<h2>WALLETS</h2>' + walletRows() +
+    '<div class="row"><button class="btn alt" data-act="linkwallet" type="button">LINK A WALLET</button>' +
+    (st.hasEmbedded ? '<button class="btn alt" data-act="exportkey" type="button">EXPORT EMBEDDED KEY</button>' : '') + '</div>' +
+    '<div class="row"><button class="btn alt" data-act="mydata2" type="button">MY DATA</button><button class="btn alt" data-act="logout" type="button">LOG OUT</button></div>' +
+    '<div class="row"><button class="btn alt" data-act="delacct" type="button">DELETE ACCOUNT</button><button class="btn alt" data-act="title" type="button">BACK</button></div>');
+}
+
+function showRankedAccount(msg?: string): void {
+  if (!account?.player) { showAccount('Choose a ranked name first.', true); return }
+  show('<span class="eyebrow">RANKED, SERVER PICKS THE CHART</span><h1>RANKED RUN</h1>' +
+    '<p>Playing as <b>' + esc(account.player.name) + '</b>. The server checks your login for every ranked run.</p>' +
+    (msg ? '<p style="color:var(--down)">' + esc(msg) + '</p>' : '') +
+    (boundPass ? '<p><span class="chip y">PASS #' + esc(boundPass) + '</span>Bound to your pass in ' + esc(short(passWallet?.address ?? '')) + '; that wallet signs once. <button class="btn alt" data-act="unbind" type="button" style="font-size:10px;padding:4px 6px">UNBIND</button></p>' : '') +
+    '<div class="row"><button class="btn alt" data-act="title" type="button">BACK</button><button class="btn go" data-act="enteracct" type="button">ENTER</button></div>');
+}
+
+function showDeleteAccountAsk(msg?: string): void {
+  const st = auth?.state();
+  const emb = st?.wallets.find((w) => w.embedded);
+  show('<span class="eyebrow">ACCOUNT</span><h1>DELETE ACCOUNT</h1>' +
+    '<p>This deletes your account from Exit Liquidity: your ranked name, every ranked run and receipt, your leaderboard entries and your keepsake. You can also delete your login at Privy, the service that runs logins and embedded wallets.</p>' +
+    (emb ? '<p style="color:var(--down)">Your embedded wallet ' + esc(short(emb.address)) + ' is detached from your login for good when the Privy login is deleted. Anything it holds (a pass, test ETH) stays at that address but you can only reach it with its private key. Export the key first.</p><div class="row"><button class="btn alt" data-act="exportkey" type="button">EXPORT EMBEDDED KEY</button></div>' : '') +
+    '<p>Passes and results already on the blockchain cannot be deleted by anyone.</p>' +
+    (account?.canDeletePrivyUser
+      ? '<label style="display:block;margin:8px 0"><input type="checkbox" id="delprivy" checked> Also delete my Privy login' + (emb ? ' (detaches the embedded wallet)' : '') + '</label>'
+      : '<p style="color:var(--dim)">This server cannot delete Privy logins (no app secret). Your game data is deleted; the operator removes the Privy login on request.</p>') +
+    '<p>Type DELETE to confirm.</p><input id="delword" maxlength="10" autocomplete="off" style="' + inputStyle + '">' +
+    (msg ? '<p style="color:var(--down)">' + esc(msg) + '</p>' : '') +
+    '<div class="row"><button class="btn alt" data-act="account" type="button">CANCEL</button><button class="btn sell" data-act="delacctgo" type="button">DELETE</button></div>');
+}
+
+/** A PassWallet for one of the account's wallets (embedded, or an external one connected in this browser). */
+async function walletFor(address: string): Promise<import('./chain.ts').PassWallet> {
+  const hit = walletCache.get(address.toLowerCase());
+  if (hit) return hit;
+  const m = await chainModule();
+  const info = await m.chainInfo();
+  if (!info || !auth) throw new Error('Passes are not enabled on this server.');
+  const w = await m.PassWallet.withProvider(info, await auth.provider(address), address as `0x${string}`);
+  walletCache.set(address.toLowerCase(), w);
+  return w;
+}
+
+async function showMyPassAccount(msg?: string, err?: boolean): Promise<void> {
+  screen = 'other';
+  show('<span class="eyebrow">TESTNET</span><h1>MY PASS</h1><p>Checking your wallets on chain.</p>');
+  const m = await chainModule();
+  const info = await m.chainInfo();
+  if (!info || !auth) { show('<h1>MY PASS</h1><p>Passes are not enabled on this server.</p><div class="row"><button class="btn alt" data-act="title" type="button">BACK</button></div>'); return }
+  const r = await meFetch(auth, '/api/me/passes');
+  const wallets = r.ok ? ((await r.json()) as { wallets: { address: string; embedded: boolean; client: string | null; passes: { id: string }[] }[] }).wallets : [];
+  if (!mintTo || !wallets.some((w) => w.address === mintTo)) mintTo = (wallets.find((w) => w.embedded) ?? wallets[0])?.address ?? null;
+  let h = '<span class="eyebrow">' + esc(info.chainName.toUpperCase()) + ', TEST NETWORK ONLY</span><h1>MY PASS</h1>' +
+    (msg ? '<p style="color:' + (err ? 'var(--down)' : 'var(--up)') + '">' + esc(msg) + '</p>' : '') +
+    '<div class="stat"><span>Founder passes</span><span>' + info.minted + ' of ' + info.supply + '</span><span>Sale</span><span>' + esc(info.sale.replace('_', ' ')) + '</span></div>';
+  if (!wallets.length) h += '<p>Your account has no wallet yet.</p><div class="row"><button class="btn alt" data-act="linkwallet" type="button">LINK A WALLET</button></div>';
+  if (info.sale === 'open' && wallets.length) {
+    // The pass is minted to the wallet that sends the mint. The player picks it here.
+    h += '<h2>THE PASS GOES TO</h2>' + wallets.map((w) => '<label style="display:block"><input type="radio" name="mintto" data-act="mintto" data-addr="' + esc(w.address) + '"' + (w.address === mintTo ? ' checked' : '') + '> ' +
+      esc(short(w.address)) + ' (' + (w.embedded ? 'embedded' : esc(w.client ?? 'external')) + ')</label>').join('') +
+      '<div class="row">' + [1, 2, 3].map((q) => '<button class="btn go" data-act="passmint2" data-q="' + q + '" type="button">MINT ' + q + '</button>').join('') + '</div>' +
+      '<p class="eyebrow">AT MOST ' + info.maxPerWallet + ' PER WALLET. PRICE IS SHOWN IN THE WALLET BEFORE YOU CONFIRM.</p>';
+  }
+  for (const w of wallets) {
+    h += '<h2>' + esc(short(w.address)) + (w.embedded ? ' (EMBEDDED)' : '') + '</h2>';
+    if (!w.passes.length) h += '<p style="color:var(--dim)">No passes in this wallet.</p>';
+    for (const p of w.passes) {
+      const c = cards.get(p.id);
+      h += '<div id="card-' + esc(p.id) + '">' + (c ? m.cardHtml(c.card, c.side) : '<div class="passcard" style="background:#2b2f38;color:#c9ced8"><div class="ptop"><span class="porg">EXIT LIQUIDITY</span><span>#' + esc(p.id) + '</span></div><p>Card locked. This wallet signs to open it.</p></div>') + '</div>' +
+        '<div class="row"><button class="btn alt" data-act="passcard2" data-id="' + esc(p.id) + '" data-addr="' + esc(w.address) + '" type="button">' + (c ? 'REFRESH' : 'SHOW CARD') + '</button>' +
+        (c ? '<button class="btn alt" data-act="passback" data-id="' + esc(p.id) + '" type="button">FLIP</button>' : '') +
+        '<button class="btn alt" data-act="bindpass2" data-id="' + esc(p.id) + '" data-addr="' + esc(w.address) + '" type="button">PLAY RANKED</button></div>';
+    }
+  }
+  h += '<div class="row"><button class="btn alt" data-act="title" type="button">BACK</button></div><p class="eyebrow">CONTRACT ' + esc(info.playPass) + '</p>';
+  show(h);
+}
+
+async function accountAction(act: string, b: HTMLElement): Promise<void> {
+  if (!auth) return;
+  try {
+    if (act === 'setname') {
+      const name = (($('aname') as HTMLInputElement).value || '').trim();
+      const r = await meFetch(auth, '/api/me/name', { name });
+      const j = await r.json();
+      if (!r.ok) return showAccount(j.error ?? 'Could not save the name.', true);
+      account!.player = j.player; showAccount('Saved.');
+    } else if (act === 'linkwallet') { await auth.linkWallet(); walletCache.clear(); await syncAccount(); showAccount() }
+    else if (act === 'exportkey') await auth.exportWallet();
+    else if (act === 'logout') { await auth.logout(); account = null; rememberSession(false); walletCache.clear(); showTitle() }
+    else if (act === 'mydata2') {
+      const r = await meFetch(auth, '/api/account/export', {});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(await r.json(), null, 2)], { type: 'application/json' }));
+      a.download = 'exit-liquidity-my-data.json'; a.click();
+    } else if (act === 'delacctgo') {
+      if ((($('delword') as HTMLInputElement).value || '').trim() !== 'DELETE') return showDeleteAccountAsk('Type DELETE to confirm.');
+      const delPrivy = ($('delprivy') as HTMLInputElement | null)?.checked ?? false;
+      const r = await meFetch(auth, '/api/account/delete', { deletePrivyUser: delPrivy });
+      if (!r.ok) return showDeleteAccountAsk('The server refused (' + r.status + ').');
+      const j = await r.json() as { privyUserDeleted: boolean };
+      await auth.logout().catch(() => {});
+      account = null; rememberSession(false); clearIdentity(); writeMintLocal(null); walletCache.clear();
+      show('<h1>DELETED</h1><p>Your account and its runs are gone from the server' + (j.privyUserDeleted ? ', and your Privy login is deleted' : '') + '. This browser has forgotten it too.</p><div class="row"><button class="btn alt" data-act="title" type="button">OK</button></div>');
+    } else if (act === 'mintto') { mintTo = b.dataset.addr ?? null }
+    else if (act === 'passmint2') {
+      if (!mintTo) return;
+      show('<h1>MINTING</h1><p>The pass goes to ' + esc(short(mintTo)) + '. Confirm in that wallet, then wait for the transaction.</p>');
+      const w = await walletFor(mintTo);
+      await w.mint(Number(b.dataset.q));
+      await new Promise((r) => setTimeout(r, 2000)); // let the server index the mint
+      await showMyPassAccount('Minted to ' + short(mintTo) + '.');
+    } else if (act === 'passcard2') {
+      const id = b.dataset.id!, w = await walletFor(b.dataset.addr!);
+      cards.set(id, { card: await w.card(id), side: 'front' });
+      await showMyPassAccount();
+    } else if (act === 'bindpass2') {
+      passWallet = await walletFor(b.dataset.addr!);
+      boundPass = b.dataset.id ?? null;
+      showRankedAccount();
+    } else if (act === 'enteracct') {
+      const getToken = () => auth!.accessToken();
+      if (boundPass && passWallet) {
+        show('<h1>SIGN IN YOUR WALLET</h1><p>Your wallet signs a message proving you hold pass #' + esc(boundPass) + '. Signing costs nothing.</p>');
+        const proof = await passWallet.bindProof(boundPass);
+        show('<h1>CONNECTING</h1><p>Asking the run server for a chart.</p>');
+        const d = await RemoteDriver.connect('', proof, getToken);
+        d.onSettlement = refreshSettleArea; startRun(d);
+      } else {
+        show('<h1>CONNECTING</h1><p>Asking the run server for a chart.</p>');
+        startRun(await RemoteDriver.connect('', undefined, getToken));
+      }
+    }
+  } catch (e) {
+    const m = (e as Error).message.split('\n')[0]!;
+    if (act === 'enteracct') showRankedAccount(m); else if (act.startsWith('pass') || act === 'bindpass2' || act === 'mintto') void showMyPassAccount(m, true); else showAccount(m, true);
+  }
+}
+
 function newPractice(): void {
   const m = readMint();
   let mint: string | null = null;
@@ -584,7 +781,11 @@ md.addEventListener('click', (e) => {
   else if (act === 'title') { if (drv) { drv.close(); drv = null } ranked = false; attract = new LocalDriver({ seed: rndSeed(), mint: null, attract: true, native: NATIVE }); vlo = vhi = null; renderNews(); renderInds(); renderCons(); showTitle() }
   else if (act === 'ranked') showRankedEntry();
   else if (act === 'board') void showBoard();
-  else if (act === 'mypass') void showMyPass();
+  else if (act === 'mypass') void (account ? showMyPassAccount() : showMyPass());
+  else if (act === 'login') void startAuth(true).catch(() => show('<h1>LOGIN UNAVAILABLE</h1><p>Login could not start right now. You can keep playing as a guest; your progress stays in this browser.</p><div class="row"><button class="btn alt" data-act="title" type="button">OK</button></div>'));
+  else if (act === 'account') showAccount();
+  else if (act === 'delacct') showDeleteAccountAsk();
+  else if (act && ['setname', 'linkwallet', 'exportkey', 'logout', 'mydata2', 'delacctgo', 'mintto', 'passmint2', 'passcard2', 'bindpass2', 'enteracct'].includes(act)) void accountAction(act, b);
   else if (act === 'connect') void connectWallet();
   else if (act === 'passmint') void doMint(Number(b.dataset.q));
   else if (act === 'passcard') void showCard(b.dataset.id!, 'front');
@@ -666,6 +867,12 @@ showTitle();
 requestAnimationFrame(frame);
 void rankedAvailable().then((up) => { rankedUp = up; if (screen === 'title') showTitle() });
 void fetch('/api/chain').then((r) => { passUp = r.ok; if (passUp && screen === 'title') showTitle() }, () => {});
+// Login is optional. Privy loads only for a browser that logged in before, or when LOG IN is pressed.
+void authConfig().then((cfg) => {
+  authCfg = cfg;
+  if (cfg && hadSession()) void startAuth(false).catch(() => rememberSession(false));
+  if (screen === 'title') showTitle();
+});
 
 // Test hook: lets a scripted browser step ticks deterministically (?manual).
 if (TEST) (window as any).__el = { get drv() { return drv }, step(n = 1) { for (let k = 0; k < n; k++) (drv as LocalDriver | null)?.step(); drv?.frame(0) } };

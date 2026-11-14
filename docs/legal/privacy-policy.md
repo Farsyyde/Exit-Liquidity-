@@ -74,3 +74,15 @@ Add this section only when the pass launches. Today it exists on a test network 
 - **Your wallet and its network provider** (for example a browser extension and the RPC service it connects to) see your IP address, wallet address and every transaction you sign. They are your choice and covered by their own policies.
 - **Robinhood Chain RPC** ([LINK]): our server reads the chain through it. It sees our server's requests, which include pass ids and wallet addresses.
 - **Google Wallet (later):** if you save your pass to Google Wallet, Google receives the pass content and your Google account saves it. Covered by Google's policy.
+
+## Addendum, not yet in effect: logging in (Privy)
+
+Add this section when login launches.
+
+- **Logging in is optional.** You can play practice and ranked without an account. Progress then stays in your browser.
+- **Privy runs the login.** If you press LOG IN, the login window is provided by Privy, Inc. ([LINK to privy.io/privacy-policy]). Privy receives the email address you enter, or the profile shared by the social account you pick (Google, X or Discord), your IP address and device information, and the wallets you link. Privy may create a wallet for you (an "embedded wallet"); its key is held by Privy's key management system, not by us.
+- **What we keep.** We keep your Privy user id, the ranked name and runs linked to it, and your practice keepsake. We do not keep your email or social profile. When you first log in, the progress saved in that browser moves into your account.
+- **Wallets.** You can link several wallets to one account. We ask Privy which wallets are linked, and the blockchain which passes those wallets hold, each time it matters. We do not keep a copy of either.
+- **Your embedded wallet key.** You can export the key of your embedded wallet from the account screen and use the wallet anywhere.
+- **Deleting your account.** DELETE ACCOUNT removes everything listed above from our server, and (unless you untick the box) asks Privy to delete your Privy account. **Deleting the Privy account permanently detaches the embedded wallet**: anything in it, including passes, can only be reached with an exported key. Export it first. Blockchain records cannot be deleted by anyone.
+

@@ -62,6 +62,15 @@ export class PassWallet {
 
   static available(): boolean { return !!provider() }
 
+  /** A wallet from the Privy account (embedded or linked external), already on the app's chain. */
+  static async withProvider(info: ChainInfo, eth: EIP1193Provider, address: Address): Promise<PassWallet> {
+    const w = new PassWallet(info);
+    await w.ensureChain(eth);
+    w.address = address;
+    w.walletClient = createWalletClient({ account: address, chain: w.chain, transport: custom(eth) });
+    return w;
+  }
+
   /** Takes over another instance's connected wallet (used after re-reading sale info). */
   adopt(other: PassWallet): PassWallet { this.walletClient = other.walletClient; this.address = other.address; return this }
 
@@ -76,7 +85,7 @@ export class PassWallet {
     return addr;
   }
 
-  private async ensureChain(eth: EIP1193Provider): Promise<void> {
+  async ensureChain(eth: EIP1193Provider): Promise<void> {
     const want = numberToHex(this.info.chainId);
     const have = (await eth.request({ method: 'eth_chainId' })) as string;
     if (have.toLowerCase() === want) return;

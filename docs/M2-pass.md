@@ -114,3 +114,27 @@ Then give me, through the server's environment (not chat): `GOOGLE_WALLET_ISSUER
 6. **Legal facts** for the privacy policy and terms drafts in `docs/legal/` (operator, host, contact, minimum age, jurisdiction, retention).
 7. **Deploying the privacy fixes to the live game** (self-hosted fonts, DELETE ACCOUNT and MY DATA). They are on this branch and change only what the privacy work requires, but the live game stays as it is until you say so.
 8. **Token metadata.** The pass has no `tokenURI` yet, so marketplaces and explorers show it blank. Add metadata now or leave it for the Indicators milestone.
+
+## Login (Privy), optional
+
+Guests play without logging in; progress stays in localStorage. LOG IN (OPTIONAL) loads Privy on demand (guests never download it).
+
+Server env (secrets go in the server environment or a secret manager, never in the repo):
+
+| Variable | What |
+|---|---|
+| `PRIVY_APP_ID` | Privy app id (public) |
+| `PRIVY_VERIFICATION_KEY` | The app's ES256 verification key (dashboard, App settings). `\n` is unescaped. Used to verify access tokens offline. |
+| `PRIVY_APP_SECRET` | Lets the server read linked wallets fresh from Privy's API and delete Privy users. Without it the server falls back to the identity token and cannot delete Privy users. |
+| `PRIVY_CLIENT_ID` | Optional app client id |
+
+Without `PRIVY_APP_ID` and `PRIVY_VERIFICATION_KEY`, `/api/auth-config` answers 404 and the LOG IN button is hidden.
+
+Privy dashboard: enable email, Google, X, Discord and external wallets; turn on identity tokens; add the site origin(s) to allowed origins; embedded wallets on for users without wallets; key export allowed. Robinhood Chain testnet (46630) is configured in code as a custom chain; mainnet (4663) is defined but not in `supportedChains`.
+
+Behaviour:
+- First login moves the browser's guest ranked player and practice keepsake into the account (only if that guest is not already in another account).
+- An account can link several wallets. `/api/me/passes` and run binding ask Privy for the linked wallets and read `ownerOf` on chain every time; nothing is cached.
+- Ranked hello carries the Privy access token; the server verifies it (signature, issuer, audience, expiry) before the run starts.
+- At mint the player picks which linked wallet receives the pass.
+- DELETE ACCOUNT removes server data and, if ticked, the Privy user (which detaches the embedded wallet for good; export the key first).

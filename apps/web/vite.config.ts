@@ -11,4 +11,6 @@ export default defineConfig({
     },
   },
   build: { target: 'es2020' },
+  // The Privy island is TSX; no React plugin is needed for a production build.
+  esbuild: { jsx: 'automatic' },
 });

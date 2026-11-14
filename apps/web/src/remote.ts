@@ -71,13 +71,20 @@ export class RemoteDriver implements Driver {
 
   private constructor(private ws: WebSocket) {}
 
-  static connect(name: string, pass?: { id: string; message: string; signature: string }): Promise<RemoteDriver> {
+  /** Logged in: fetches a fresh Privy access token for hello and every reconnect. */
+  private privyToken: (() => Promise<string | null>) | null = null;
+
+  static connect(name: string, pass?: { id: string; message: string; signature: string }, privyToken?: () => Promise<string | null>): Promise<RemoteDriver> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(wsUrl());
       const d = new RemoteDriver(ws);
       const prev = loadIdentity();
       let settled = false;
-      ws.onopen = () => d.send({ t: 'hello', v: PROTOCOL_VERSION, name, token: prev && prev.name === name ? prev.token : undefined, ...(pass ? { pass } : {}) });
+      d.privyToken = privyToken ?? null;
+      ws.onopen = () => {
+        if (privyToken) void privyToken().then((tok) => d.send({ t: 'hello', v: PROTOCOL_VERSION, name: '', privy: tok ?? '', ...(pass ? { pass } : {}) }));
+        else d.send({ t: 'hello', v: PROTOCOL_VERSION, name, token: prev && prev.name === name ? prev.token : undefined, ...(pass ? { pass } : {}) });
+      };
       ws.onerror = () => { if (!settled) { settled = true; reject(new Error('Could not reach the run server.')) } };
       ws.onclose = () => { if (!settled) { settled = true; reject(new Error('The run server closed the connection.')) } else d.dropped() };
       ws.onmessage = (e) => {
@@ -106,7 +113,10 @@ export class RemoteDriver implements Driver {
     if (this.closedByUs) return;
     const ws = new WebSocket(wsUrl());
     this.ws = ws;
-    ws.onopen = () => this.send({ t: 'hello', v: PROTOCOL_VERSION, name: this.identity.name, token: this.identity.token, resume: true });
+    ws.onopen = () => {
+      if (this.privyToken) void this.privyToken().then((tok) => this.send({ t: 'hello', v: PROTOCOL_VERSION, name: '', privy: tok ?? '', resume: true }));
+      else this.send({ t: 'hello', v: PROTOCOL_VERSION, name: this.identity.name, token: this.identity.token, resume: true });
+    };
     ws.onclose = () => { if (this.ws === ws) this.dropped() };
     ws.onerror = () => { /* close follows */ };
     ws.onmessage = (e) => this.handle(JSON.parse(String(e.data)) as ServerMsg);
