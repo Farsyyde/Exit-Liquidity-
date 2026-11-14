@@ -24,8 +24,9 @@ import {
 } from 'viem';
 import { privateKeyToAccount, generatePrivateKey, type PrivateKeyAccount } from 'viem/accounts';
 import { createSiweMessage, parseSiweMessage, generateSiweNonce } from 'viem/siwe';
-import { createIssuer, kvStores, toNodeHandler, type Issuer } from '@erc8426/issuer';
+import { createIssuer, kvStores, toNodeHandler, type Issuer, type IssuerProvider } from '@erc8426/issuer';
 import type { PassContent, PassFileProvider } from '@erc8426/core';
+import { googleFormatProvider, googleWalletClient, saveOrigins, type GoogleObjectStore, type GoogleObjectRecord } from '@erc8426/google';
 import type { Db } from './db.ts';
 import { parseSeedHex } from './seeds.ts';
 
@@ -144,6 +145,14 @@ export interface PassOptions {
   linkSecretPath?: string | null;
   environment?: 'production' | 'development';
   maxAttemptsPerDay?: number;
+  /**
+   * Google Wallet. Off when absent. issuerId is the numeric id from the Pay
+   * and Wallet Console; the service account is the JSON key (client_email and
+   * private_key). `fetch` is for tests only.
+   */
+  google?: { issuerId: string; serviceAccount: { client_email: string; private_key: string }; classSuffix?: string; fetch?: typeof fetch } | null;
+  /** Public https URLs of the card art (from the image pack). Google omits slots without one. */
+  images?: { logo?: string; icon?: string; hero?: string; heroFounders?: string } | null;
   /** Milliseconds between log polls. */
   pollMs?: number;
   log?: (m: string) => void;
@@ -204,6 +213,7 @@ export function createPassService(o: PassOptions) {
       title: 'EXIT LIQUIDITY',
       headline: founder ? 'FOUNDER PASS' : 'PASS',
       colors: STYLE_COLORS[style] ?? STYLE_COLORS[UNREVEALED]!,
+      ...passImages(founder),
       header: [{ key: 'pass', label: 'PASS', value: `#${tokenId}` }],
       primary: [{
         key: 'best', label: superseded ? 'STATUS' : 'BEST LAYER',
@@ -229,6 +239,18 @@ export function createPassService(o: PassOptions) {
     };
   }
 
+  /** Card art from the configured public URLs. Founders get the Gold hero when one is set. */
+  function passImages(founder: boolean): Pick<PassContent, 'images'> {
+    const im = o.images;
+    if (!im) return {};
+    const images: NonNullable<PassContent['images']> = {};
+    if (im.logo) images.logo = { url: im.logo };
+    if (im.icon) images.icon = { url: im.icon };
+    const hero = founder ? (im.heroFounders ?? im.hero) : im.hero;
+    if (hero) images.hero = { url: hero };
+    return Object.keys(images).length ? { images } : {};
+  }
+
   /** The `preview` format: the rendered content as JSON, served at a rotating capability URL behind the fresh read. */
   const previewProvider: PassFileProvider = {
     format: 'preview',
@@ -238,13 +260,34 @@ export function createPassService(o: PassOptions) {
   };
 
   /**
-   * Wallet platform providers. Empty today: the manifest's only format is
-   * `preview`, which no wallet understands, so the conformance suite waits.
-   * Google Wallet goes here (see docs/M2-pass.md, "Google Wallet").
+   * Wallet platform providers. Google Wallet when its issuer id and service
+   * account are configured; nothing otherwise (the manifest then carries only
+   * `preview`). Apple is not in scope yet.
    */
-  function walletProviders(): PassFileProvider[] {
-    return [];
+  function walletProviders(): IssuerProvider[] {
+    const g = o.google;
+    if (!g) return [];
+    if (!/^[0-9]{10,}$/.test(g.issuerId)) throw new Error('google.issuerId must be the numeric issuer id from the Pay and Wallet Console (not the merchant id)');
+    return [googleFormatProvider({
+      client: googleWalletClient({ serviceAccount: g.serviceAccount, issuerId: g.issuerId, ...(g.fetch ? { fetch: g.fetch } : {}) }),
+      // A Generic class: works for every Google account at once, no Google review.
+      classSuffix: g.classSuffix ?? 'exit_liquidity_pass_v1',
+      // Save links are accepted only from the site's own origin.
+      origins: saveOrigins([base.origin]),
+      store: googleObjectStore,
+      // Until the image pack is hosted, image slots without a public https URL are left out rather than failing.
+      unhostedImages: 'omit',
+      messageFor: () => null, // silent updates; no notifications for now
+      onError: (err, where) => log(`[google] ${where}: ${err.message}`),
+    })];
   }
+
+  /** Google object records (object id per serial and owner) on SQLite, so they survive restarts. */
+  const googleObjectStore: GoogleObjectStore = {
+    async get(serial) { const v = await o.db.kv.get('google:obj:' + serial); return v ? JSON.parse(v) as GoogleObjectRecord : null },
+    async put(serial, record) { await o.db.kv.set('google:obj:' + serial, JSON.stringify(record)) },
+    async delete(serial) { await o.db.kv.del('google:obj:' + serial) },
+  };
 
   const issuer: Issuer = createIssuer({
     domain,
@@ -254,6 +297,8 @@ export function createPassService(o: PassOptions) {
     mode: 'gated',
     publicClient,
     providers: [previewProvider, ...walletProviders()],
+    // The manifest's optional issuer member: lets a client check the pass it saves comes from our Google issuer.
+    ...(o.google ? { manifestIssuer: { google: { issuerId: o.google.issuerId } } } : {}),
     stores: kvStores(o.db.kv, { chainId: dep.chainId, contract: dep.playPass }),
     linkSecret,
     environment: o.environment ?? 'development',

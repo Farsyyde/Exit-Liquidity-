@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@erc8426/core": "0.4.0",
+    "@erc8426/google": "0.4.0",
     "@erc8426/issuer": "0.4.0",
     "@exit-liquidity/engine": "workspace:*",
     "@noble/hashes": "1.6.1",

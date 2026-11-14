@@ -26,6 +26,9 @@ importers:
       '@erc8426/core':
         specifier: 0.4.0
         version: 0.4.0(viem@2.40.3(typescript@5.6.3))
+      '@erc8426/google':
+        specifier: 0.4.0
+        version: 0.4.0(viem@2.40.3(typescript@5.6.3))
       '@erc8426/issuer':
         specifier: 0.4.0
         version: 0.4.0(viem@2.40.3(typescript@5.6.3))
@@ -114,6 +117,12 @@ packages:
 
   '@erc8426/core@0.4.0':
     resolution: {integrity: sha512-3Lf0Z3s5+/qcajD0pbQd4pEVWZ13Oi49zcAXOErkXnTVN3M1gAuckJaZES3lcWM7F8hR0FeJXzh9aPsysQMBCg==}
+    engines: {node: '>=22'}
+    peerDependencies:
+      viem: ^2.21.0
+
+  '@erc8426/google@0.4.0':
+    resolution: {integrity: sha512-4UNjmj+rh6a9u6RGGw46AK7gRhI/EOJrIYiu/1I8FMJ1yb9pRvBIrwSBt7RVZuJvkvplO1M8vg3BJYSYBbxNLw==}
     engines: {node: '>=22'}
     peerDependencies:
       viem: ^2.21.0
@@ -897,6 +906,9 @@ packages:
     peerDependencies:
       ws: '*'
 
+  jose@5.10.0:
+    resolution: {integrity: sha512-s+3Al/p9g32Iq+oqXxkW//7jk2Vig6FF1CFqzVXoTUXt2qz89YWbL+OwS17NFYEvxC35n0FKeGO2LGYSxeM2Gg==}
+
   loupe@3.2.1:
     resolution: {integrity: sha512-CdzqowRJCeLU72bHvWqwRBBlLcMEtIvGrlvef74kMnV2AolS9Y8xUv1I0U/MNAWMhBlKIoyuEgoJ0t/bbwHbLQ==}
 
@@ -1172,6 +1184,12 @@ snapshots:
 
   '@erc8426/core@0.4.0(viem@2.40.3(typescript@5.6.3))':
     dependencies:
+      viem: 2.40.3(typescript@5.6.3)
+
+  '@erc8426/google@0.4.0(viem@2.40.3(typescript@5.6.3))':
+    dependencies:
+      '@erc8426/core': 0.4.0(viem@2.40.3(typescript@5.6.3))
+      jose: 5.10.0
       viem: 2.40.3(typescript@5.6.3)
 
   '@erc8426/issuer@0.4.0(viem@2.40.3(typescript@5.6.3))':
@@ -1733,6 +1751,8 @@ snapshots:
   isows@1.0.7(ws@8.18.3):
     dependencies:
       ws: 8.18.3
+
+  jose@5.10.0: {}
 
   loupe@3.2.1: {}
 
