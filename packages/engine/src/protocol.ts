@@ -23,7 +23,9 @@ export type ClientMsg =
   /** resume: only reattach to a run in progress (or just finished); never start a new attempt. */
   | { t: 'hello'; v: number; name: string; token?: string; lite?: boolean; resume?: boolean;
       /** Bind this run to a pass: a signed /api/pass-challenge message. Optional; ranked is free without one. */
-      pass?: { id: string; message: string; signature: string } }
+      pass?: { id: string; message: string; signature: string };
+      /** Logged in: a Privy access token instead of name and token. privyId is the identity token (only needed without an app secret on the server). */
+      privy?: string; privyId?: string }
   | { t: 'go' }
   | { t: 'next' }
   | { t: 'shop'; code: string }

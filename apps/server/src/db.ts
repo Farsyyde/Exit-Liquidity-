@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS runs (
   UNIQUE (player_id, day, attempt)
 );
 CREATE INDEX IF NOT EXISTS runs_day ON runs(day, status);
+CREATE TABLE IF NOT EXISTS accounts (
+  privy_user_id TEXT PRIMARY KEY,
+  player_id INTEGER UNIQUE REFERENCES players(id),
+  practice_mint TEXT,
+  created_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL,
@@ -100,6 +106,61 @@ export function openDb(path: string) {
     raw: db,
     close: () => db.close(),
 
+    // ------------------------------------------------ Privy accounts
+
+    account(userId: string): { privy_user_id: string; player_id: number | null; practice_mint: string | null } | null {
+      return (db.prepare('SELECT privy_user_id, player_id, practice_mint FROM accounts WHERE privy_user_id = ?').get(userId) as never) ?? null;
+    },
+    accountOfPlayer(player: number): string | null {
+      return ((db.prepare('SELECT privy_user_id FROM accounts WHERE player_id = ?').get(player) as { privy_user_id: string } | undefined)?.privy_user_id) ?? null;
+    },
+    playerById(id: number): PlayerRow | null { return (db.prepare('SELECT id, name, token_hash FROM players WHERE id = ?').get(id) as PlayerRow | undefined) ?? null },
+
+    /**
+     * First login: create the account and bring over what the guest had in
+     * this browser. A guest ranked identity (name and token) is adopted only
+     * when it checks out and belongs to no other account, and only when the
+     * account has no player yet. The practice keepsake is kept when the
+     * account has none.
+     */
+    loginAccount: db.transaction((userId: string, now: number, guest: { name: string; token: string } | null, practiceMint: string | null) => {
+      let acct = db.prepare('SELECT privy_user_id, player_id, practice_mint FROM accounts WHERE privy_user_id = ?').get(userId) as { player_id: number | null; practice_mint: string | null } | undefined;
+      const created = !acct;
+      if (!acct) { db.prepare('INSERT INTO accounts (privy_user_id, player_id, practice_mint, created_ms) VALUES (?, NULL, NULL, ?)').run(userId, now); acct = { player_id: null, practice_mint: null } }
+      let adopted = false, guestKept = false;
+      if (guest) {
+        const row = q.playerByName.get(guest.name) as PlayerRow | undefined;
+        const ok = row && hashToken(guest.token) === row.token_hash;
+        const taken = ok && db.prepare('SELECT 1 FROM accounts WHERE player_id = ?').get(row!.id);
+        if (ok && !taken && acct.player_id === null) {
+          db.prepare('UPDATE accounts SET player_id = ? WHERE privy_user_id = ?').run(row!.id, userId);
+          acct.player_id = row!.id; adopted = true;
+        } else if (ok && !taken) guestKept = true; // the account already has a player; the guest name stays a separate guest
+      }
+      if (practiceMint && !acct.practice_mint) {
+        db.prepare('UPDATE accounts SET practice_mint = ? WHERE privy_user_id = ?').run(practiceMint, userId);
+        acct.practice_mint = practiceMint;
+      }
+      return { created, adopted, guestKept, playerId: acct.player_id, practiceMint: acct.practice_mint };
+    }),
+
+    setPracticeMint(userId: string, json: string | null): void { db.prepare('UPDATE accounts SET practice_mint = ? WHERE privy_user_id = ?').run(json, userId) },
+
+    /** Creates the ranked player for an account that has none. Null if the name is taken. */
+    createAccountPlayer: db.transaction((userId: string, name: string, now: number) => {
+      const acct = db.prepare('SELECT player_id FROM accounts WHERE privy_user_id = ?').get(userId) as { player_id: number | null } | undefined;
+      if (!acct) return { error: 'no account' as const };
+      if (acct.player_id !== null) return { error: 'has player' as const };
+      if (q.playerByName.get(name)) return { error: 'taken' as const };
+      // No guest token exists for an account player: its token hash is random and unusable, login is through Privy.
+      const info = q.insertPlayer.run(name, hashToken(randomBytes(32).toString('base64url')), now);
+      const id = Number(info.lastInsertRowid);
+      db.prepare('UPDATE accounts SET player_id = ? WHERE privy_user_id = ?').run(id, userId);
+      return { id };
+    }),
+
+    deleteAccountRow(userId: string): void { db.prepare('DELETE FROM accounts WHERE privy_user_id = ?').run(userId) },
+
     /** Checks a name and token without creating anything. */
     authenticate(name: string, token: string): PlayerRow | null {
       const row = q.playerByName.get(name) as PlayerRow | undefined;
@@ -122,6 +183,7 @@ export function openDb(path: string) {
 
     /** Deletes a player and every row tied to them: runs (and so their leaderboard entries and published receipts), the minted indicator, the login. */
     deleteAccount: db.transaction((player: number) => {
+      db.prepare('UPDATE accounts SET player_id = NULL WHERE player_id = ?').run(player);
       const runs = db.prepare('DELETE FROM runs WHERE player_id = ?').run(player).changes;
       db.prepare('DELETE FROM mints WHERE player_id = ?').run(player);
       const players = db.prepare('DELETE FROM players WHERE id = ?').run(player).changes;

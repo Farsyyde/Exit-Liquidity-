@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { startServer } from './server.ts';
 import { createPassService, loadDeployment } from './pass.ts';
+import { createPrivyAuth } from './privy.ts';
+import { readFileSync } from 'node:fs';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const env = process.env;
@@ -30,6 +32,20 @@ const srv = await startServer({
         linkSecret: env.EXITLIQ_LINK_SECRET,
         linkSecretPath: resolve(here, '../data/link-secret'),
         environment: env.EXITLIQ_ENV === 'production' ? 'production' : 'development',
+        // Google Wallet: on when both are set. The service account JSON comes from a secret store, as a file or a value.
+        google: env.GOOGLE_WALLET_ISSUER_ID && (env.GOOGLE_WALLET_SA_JSON || env.GOOGLE_WALLET_SA_FILE)
+          ? { issuerId: env.GOOGLE_WALLET_ISSUER_ID, serviceAccount: JSON.parse(env.GOOGLE_WALLET_SA_JSON ?? readFileSync(env.GOOGLE_WALLET_SA_FILE!, 'utf8')) }
+          : null,
+        images: env.EXITLIQ_PASS_IMAGES ? JSON.parse(env.EXITLIQ_PASS_IMAGES) : null,
+      })
+    : null,
+  // Privy login. Guests play without it. The app secret stays on the server.
+  privy: env.PRIVY_APP_ID && env.PRIVY_VERIFICATION_KEY
+    ? createPrivyAuth({
+        appId: env.PRIVY_APP_ID,
+        verificationKey: env.PRIVY_VERIFICATION_KEY.replace(/\\n/g, '\n'),
+        appSecret: env.PRIVY_APP_SECRET ?? null,
+        clientId: env.PRIVY_CLIENT_ID ?? null,
       })
     : null,
 });

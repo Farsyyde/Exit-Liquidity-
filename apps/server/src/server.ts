@@ -12,6 +12,7 @@ import { commitOf, runSeedOf, parseSeedHex, utcDay } from './seeds.ts';
 import { loadOrCreateSigner, type Signer } from './sign.ts';
 import { RunSession } from './session.ts';
 import type { PassService } from './pass.ts';
+import type { PrivyAuth } from './privy.ts';
 
 export interface ServerOptions {
   port?: number;
@@ -31,6 +32,8 @@ export interface ServerOptions {
   resumeKeepMs?: number;
   /** Messages a connection may send per second before it is dropped. */
   maxMsgsPerSec?: number;
+  /** Privy login. Absent: guests only, exactly as before. */
+  privy?: PrivyAuth | null;
   /** M2 pass features (issuer, binding, settlement). Absent: the server is exactly the M1 run server. */
   pass?: PassService | ((db: Db) => PassService) | null;
   /** How often the seed operator job runs when the pass is enabled. 0 turns it off. */
@@ -56,6 +59,7 @@ export async function startServer(o: ServerOptions = {}) {
   const db: Db = openDb(o.dbPath ?? ':memory:');
   const signer: Signer = loadOrCreateSigner(o.signerKeyPath ?? null);
   const passSvc: PassService | null = typeof o.pass === 'function' ? o.pass(db) : (o.pass ?? null);
+  const privy: PrivyAuth | null = o.privy ?? null;
   const voided = db.voidLiveRuns(now());
   if (voided) log(`voided ${voided} runs left live by a previous process`);
   /** Runs in progress, by player. One per player at a time. */
@@ -108,23 +112,103 @@ export async function startServer(o: ServerOptions = {}) {
     });
   }
 
+  function bearer(req: IncomingMessage): string | null {
+    const h = req.headers.authorization;
+    return typeof h === 'string' && h.startsWith('Bearer ') ? h.slice(7).trim() : null;
+  }
+
+  function stopPlayerRuns(playerId: number): void {
+    const s = live.get(playerId);
+    if (s) { attachedBy.get(s)?.ws.close(); attachedBy.delete(s); s.discard(); live.delete(playerId) }
+    recent.delete(playerId);
+  }
+
   async function accountRoute(req: IncomingMessage, res: ServerResponse, action: 'export' | 'delete'): Promise<void> {
-    let body: { name?: unknown; token?: unknown };
+    let body: { name?: unknown; token?: unknown; deletePrivyUser?: unknown };
     const raw = await readBody(req);
     if (raw === null) return json(res, 413, { error: 'body too large' });
     try { body = JSON.parse(raw) } catch { return json(res, 400, { error: 'bad request' }) }
+    // Logged in: the Privy access token identifies the account.
+    const tok = bearer(req);
+    if (tok && privy) {
+      const uid = await privy.verify(tok);
+      if (!uid) return json(res, 401, { error: 'login expired' });
+      const acct = db.account(uid);
+      if (action === 'export') {
+        let wallets: unknown = null;
+        try { wallets = await privy.linkedWallets(uid, (req.headers['privy-id-token'] as string) ?? null) } catch { wallets = 'unavailable' }
+        return json(res, 200, { privyUserId: uid, linkedWallets: wallets, practiceMint: acct?.practice_mint ? JSON.parse(acct.practice_mint) : null, ranked: acct?.player_id != null ? db.accountData(acct.player_id) : null });
+      }
+      let runs = 0;
+      if (acct?.player_id != null) { stopPlayerRuns(acct.player_id); runs = db.deleteAccount(acct.player_id).runs }
+      db.deleteAccountRow(uid);
+      // The Privy user is deleted only when the player confirmed it (the client warns about the embedded wallet first).
+      let privyUserDeleted = false;
+      if (body.deletePrivyUser === true) {
+        try { privyUserDeleted = await privy.deleteUser(uid) } catch (e) { log('privy user deletion failed: ' + (e instanceof Error ? e.message : String(e))) }
+      }
+      log(`account deleted (${runs} runs, privy user ${privyUserDeleted ? 'deleted' : 'kept'})`);
+      return json(res, 200, { deleted: true, runs, privyUserDeleted });
+    }
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     const token = typeof body.token === 'string' ? body.token : '';
     const player = name && token ? db.authenticate(name, token) : null;
     // Same answer for an unknown name and a wrong token, so names cannot be probed.
     if (!player) return json(res, 401, { error: 'name and token do not match an account' });
     if (action === 'export') return json(res, 200, db.accountData(player.id));
-    const s = live.get(player.id);
-    if (s) { attachedBy.get(s)?.ws.close(); attachedBy.delete(s); s.discard(); live.delete(player.id) }
-    recent.delete(player.id);
+    stopPlayerRuns(player.id);
     const out = db.deleteAccount(player.id);
     log(`account deleted (${out.runs} runs)`);
     return json(res, 200, { deleted: true, runs: out.runs });
+  }
+
+  /** /api/me and friends: the logged in account. Every call verifies the Privy access token. */
+  async function meRoute(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+    if (!privy) return json(res, 404, { error: 'login is not enabled' });
+    const uid = await privy.verify(bearer(req));
+    if (!uid) return json(res, 401, { error: 'login expired' });
+    const idToken = typeof req.headers['privy-id-token'] === 'string' ? req.headers['privy-id-token'] : null;
+    if (path === '/api/me/passes' && req.method === 'GET') {
+      if (!passSvc) return json(res, 404, { error: 'passes are not enabled' });
+      // Every linked wallet, read from Privy now; every pass confirmed by a fresh ownerOf. Nothing cached.
+      const wallets = await privy.linkedWallets(uid, idToken);
+      const out = [];
+      for (const w of wallets) out.push({ ...w, passes: await passSvc.passesOf(w.address) });
+      return json(res, 200, { wallets: out });
+    }
+    if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
+    const raw = await readBody(req);
+    if (raw === null) return json(res, 413, { error: 'body too large' });
+    let body: Record<string, unknown>;
+    try { body = JSON.parse(raw || '{}') } catch { return json(res, 400, { error: 'bad request' }) }
+    const mintJson = (v: unknown): string | null => {
+      if (!v || typeof v !== 'object') return null;
+      const { id, runs } = v as { id?: unknown; runs?: unknown };
+      return typeof id === 'string' && IND[id] && Number.isInteger(runs) && (runs as number) > 0 && (runs as number) <= 3 ? JSON.stringify({ id, runs }) : null;
+    };
+    if (path === '/api/me') {
+      const g = body.guest as { name?: unknown; token?: unknown } | undefined;
+      const guest = g && typeof g.name === 'string' && typeof g.token === 'string' ? { name: g.name.trim(), token: g.token } : null;
+      const r = db.loginAccount(uid, now(), guest, mintJson(body.practiceMint));
+      const p = r.playerId != null ? db.playerById(r.playerId) : null;
+      return json(res, 200, {
+        userId: uid, created: r.created, adoptedGuest: r.adopted, guestKeptSeparate: r.guestKept,
+        player: p ? { id: p.id, name: p.name } : null, practiceMint: r.practiceMint ? JSON.parse(r.practiceMint) : null,
+        canDeletePrivyUser: privy.canDelete,
+      });
+    }
+    if (path === '/api/me/name') {
+      const name = typeof body.name === 'string' ? body.name.trim() : '';
+      if (!NAME.test(name)) return json(res, 400, { error: 'Use 2 to 24 letters, numbers, spaces, dots, dashes or underscores.' });
+      const r = db.createAccountPlayer(uid, name, now());
+      if ('error' in r) return json(res, 409, { error: r.error === 'taken' ? 'That name is taken.' : r.error === 'has player' ? 'This account already has a ranked name.' : 'Log in again.' });
+      return json(res, 200, { player: { id: r.id, name } });
+    }
+    if (path === '/api/me/practice-mint') {
+      db.setPracticeMint(uid, mintJson(body.mint));
+      return json(res, 200, { ok: true });
+    }
+    return json(res, 404, { error: 'not found' });
   }
 
   const http = createServer((req, res) => {
@@ -133,6 +217,13 @@ export async function startServer(o: ServerOptions = {}) {
     const today = utcDay(now());
     try {
       if (passSvc && (p === '/wallet-pass' || p.startsWith('/wallet-pass/'))) { passSvc.handleNode(req, res); return }
+      if (p === '/api/auth-config' && req.method === 'GET') {
+        return json(res, privy ? 200 : 404, privy ? { privy: { appId: privy.appId, clientId: privy.clientId } } : { error: 'login is not enabled' });
+      }
+      if (p === '/api/me' || p.startsWith('/api/me/')) {
+        void meRoute(req, res, p).catch((e) => { log('me route error ' + (e instanceof Error ? e.message : String(e))); json(res, 503, { error: 'could not complete the request' }) });
+        return;
+      }
       if (passSvc && req.method === 'POST' && p === '/api/rpc') {
         void readBody(req, 65536).then(async (b) => {
           if (b === null) return json(res, 413, { error: 'body too large' });
@@ -235,10 +326,33 @@ export async function startServer(o: ServerOptions = {}) {
       if (!session) {
         if (m.t !== 'hello' || player) return fail('bad', 'Say hello first.');
         if (m.v !== PROTOCOL_VERSION) return fail('version', 'Client is out of date. Reload the page.');
+        const hello = m;
+        // Logged in with Privy: the access token is verified here, and the account's ranked player is used.
+        if (typeof hello.privy === 'string') {
+          if (!privy) return fail('auth', 'Login is not enabled on this server.');
+          helloPending = true;
+          void privy.verify(hello.privy).then((uid) => {
+            helloPending = false;
+            if (!uid) return fail('auth', 'Your login has expired. Log in again.');
+            const acct = db.account(uid);
+            const row = acct?.player_id != null ? db.playerById(acct.player_id) : null;
+            if (!row) return fail('account', 'Choose a ranked name for your account first.');
+            proceed({ id: row.id, name: row.name }, '', uid);
+          }, () => { helloPending = false; fail('auth', 'Could not check your login. Try again.') });
+          return;
+        }
         if (typeof m.name !== 'string' || !NAME.test(m.name)) return fail('name', 'Use 2 to 24 letters, numbers, spaces, dots, dashes or underscores.');
         const login = db.login(m.name.trim(), typeof m.token === 'string' ? m.token : undefined, t);
         if ('error' in login) return fail('name', login.error);
-        player = { id: login.player.id, name: login.player.name };
+        // A name that belongs to an account is played through the account, never with a guest token.
+        if (db.accountOfPlayer(login.player.id)) return fail('name', 'This name belongs to an account. Log in to play it.');
+        proceed({ id: login.player.id, name: login.player.name }, login.token, null);
+        return;
+
+        function proceed(who0: { id: number; name: string }, tokenOut: string, accountUser: string | null): void {
+        player = who0;
+        const login = { token: tokenOut };
+        const m = hello;
         const lite = !!m.lite;
 
         // A run already going for this player is resumed, never restarted.
@@ -297,9 +411,18 @@ export async function startServer(o: ServerOptions = {}) {
         void passSvc.verifyBinding(bind.id, bind.message, bind.signature).then((v) => {
           helloPending = false;
           if ('error' in v) return fail('pass', v.error);
+          if (accountUser) {
+            // Logged in: the wallet that signed must be one of the account's linked wallets, read from Privy now.
+            void privy!.linkedWallets(accountUser, typeof hello.privyId === 'string' ? hello.privyId : null).then((ws2) => {
+              if (!ws2.some((w) => w.address.toLowerCase() === v.owner.toLowerCase())) return fail('pass', 'That wallet is not linked to your account.');
+              startNew({ id: bind.id, owner: v.owner });
+            }, () => fail('pass', 'Could not read your linked wallets. Try again.'));
+            return;
+          }
           startNew({ id: bind.id, owner: v.owner });
         }, (e: unknown) => { helloPending = false; log('pass binding failed: ' + String(e)); fail('pass', 'Could not check the pass. Try again.') });
         return;
+        }
       }
 
       switch (m.t) {

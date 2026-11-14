@@ -20,6 +20,7 @@
     "@erc8426/issuer": "0.4.0",
     "@exit-liquidity/engine": "workspace:*",
     "@noble/hashes": "1.6.1",
+    "@privy-io/node": "0.37.0",
     "better-sqlite3": "11.7.0",
     "viem": "2.40.3",
     "ws": "8.18.0"
@@ -28,6 +29,7 @@
     "@erc8426/client": "0.4.0",
     "@types/better-sqlite3": "7.6.12",
     "@types/ws": "8.5.13",
+    "jose": "5.9.6",
     "tsx": "4.19.2"
   }
 }

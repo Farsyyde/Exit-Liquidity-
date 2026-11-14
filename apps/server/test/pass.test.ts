@@ -18,6 +18,8 @@ import { PROTOCOL_VERSION, type ServerMsg } from '@exit-liquidity/engine';
 import { startServer, type RunServer } from '../src/server.ts';
 import { createPassService, loadDeployment, playPassAbi, runRegistryAbi, STYLE_COLORS, dayNumber } from '../src/pass.ts';
 import { utcDay } from '../src/seeds.ts';
+import { createPrivyAuth, type PrivyUserLike } from '../src/privy.ts';
+import { SignJWT, exportSPKI, generateKeyPair, type KeyLike } from 'jose';
 
 const PATH = `${homedir()}/.local/bin:${process.env.PATH}`;
 const hasFoundry = spawnSync('anvil', ['--version'], { env: { ...process.env, PATH } }).status === 0;
@@ -46,7 +48,14 @@ describe.skipIf(!hasFoundry)('the pass, end to end on a local chain', () => {
   let pub: ReturnType<typeof createPublicClient>;
   const wallet = (who: keyof typeof KEYS) => createWalletClient({ account: acct[who], transport: http(rpc), chain: { id: 31337, name: 'anvil', nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [rpc] } } } });
 
+  const privyUsers = new Map<string, PrivyUserLike>();
+  let privyKey: KeyLike, privyPem: string;
+  const privyToken = (sub: string) => new SignJWT({ sid: 's' }).setProtectedHeader({ alg: 'ES256', typ: 'JWT' }).setSubject(sub)
+    .setIssuer('privy.io').setAudience('pass-test-app').setIssuedAt().setExpirationTime('1h').sign(privyKey);
+
   beforeAll(async () => {
+    const kp = await generateKeyPair('ES256');
+    privyKey = kp.privateKey; privyPem = await exportSPKI(kp.publicKey);
     dir = mkdtempSync(join(tmpdir(), 'exitliq-pass-'));
     const chainPort = await freePort();
     const port = await freePort();
@@ -64,6 +73,7 @@ describe.skipIf(!hasFoundry)('the pass, end to end on a local chain', () => {
     srv = await startServer({
       port, dbPath: join(dir, 'db'), signerKeyPath: join(dir, 'k.pem'), tickMs: 0, idleMs: 0, maxMsgsPerSec: 1000, seedJobMs: 0, log: () => {},
       pass: (db) => createPassService({ db, deployment: dep, rpcUrl: rpc, baseUrl: `http://127.0.0.1:${port}`, chainKey: KEYS.server, linkSecret: 'x'.repeat(40), pollMs: 100_000, log: () => {} }),
+      privy: createPrivyAuth({ appId: 'pass-test-app', verificationKey: privyPem, api: { getUser: async (id) => privyUsers.get(id)!, deleteUser: async () => {} } }),
     });
   }, 120_000);
 
@@ -220,6 +230,50 @@ describe.skipIf(!hasFoundry)('the pass, end to end on a local chain', () => {
     expect(list.passes.map((p: { id: string }) => p.id)).toEqual(['1']);
     // the results stay with the pass
     expect(field(c, 'settled')).toBe('1');
+  }, 60_000);
+
+  it('a Privy account sees passes across every linked wallet, checked on chain each time', async () => {
+    // after the transfer test: bob holds pass 1, alice holds pass 2
+    const uid = 'did:privy:multi';
+    privyUsers.set(uid, { id: uid, linked_accounts: [
+      { type: 'wallet', chain_type: 'ethereum', address: acct.alice.address, connector_type: 'embedded', wallet_client_type: 'privy' },
+      { type: 'wallet', chain_type: 'ethereum', address: acct.bob.address, connector_type: 'injected', wallet_client_type: 'metamask' },
+    ] });
+    const tok = await privyToken(uid);
+    const get = async () => (await (await fetch(`${srv.url}/api/me/passes`, { headers: { authorization: 'Bearer ' + tok } })).json()).wallets as { address: string; embedded: boolean; passes: { id: string }[] }[];
+    let w = await get();
+    expect(w.map((x) => [x.address, x.embedded, x.passes.map((p) => p.id)])).toEqual([[acct.alice.address, true, ['2']], [acct.bob.address, false, ['1']]]);
+    // unlink bob's wallet at Privy: his pass leaves the account at once, nothing is cached
+    privyUsers.set(uid, { id: uid, linked_accounts: [privyUsers.get(uid)!.linked_accounts[0]!] });
+    w = await get();
+    expect(w.map((x) => x.passes.map((p) => p.id))).toEqual([['2']]);
+    // moving pass 2 out of the linked wallet shows on the next call, before the indexer even runs
+    const tx = await wallet('alice').writeContract({ address: dep.playPass, abi: parseAbi(['function transferFrom(address,address,uint256)']), functionName: 'transferFrom', args: [acct.alice.address, acct.bob.address, 2n] });
+    await pub.waitForTransactionReceipt({ hash: tx });
+    w = await get();
+    expect(w[0]!.passes).toEqual([]);
+    expect((await fetch(`${srv.url}/api/me/passes`)).status).toBe(401);
+  }, 60_000);
+
+  it('a logged-in player can bind a run only to a pass held by one of their linked wallets', async () => {
+    // bob now holds passes 1 and 2; the account links only alice
+    const uid = 'did:privy:binder';
+    privyUsers.set(uid, { id: uid, linked_accounts: [{ type: 'wallet', chain_type: 'ethereum', address: acct.alice.address }] });
+    const tok = await privyToken(uid);
+    await fetch(`${srv.url}/api/me`, { method: 'POST', headers: { authorization: 'Bearer ' + tok }, body: '{}' });
+    await fetch(`${srv.url}/api/me/name`, { method: 'POST', headers: { authorization: 'Bearer ' + tok }, body: JSON.stringify({ name: 'Binder' }) });
+    const tryBind = async (signer: keyof typeof KEYS) => {
+      const { message } = await (await fetch(`${srv.url}/api/pass-challenge?pass=1&address=${acct[signer].address}`)).json();
+      const signature = await acct[signer].signMessage({ message });
+      return new Promise<ServerMsg>((done) => {
+        const ws = new WebSocket(srv.url.replace('http', 'ws') + '/ws');
+        ws.on('open', () => ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, privy: tok, lite: true, pass: { id: '1', message, signature } })));
+        ws.on('message', (d) => { const m = JSON.parse(String(d)); if (m.t === 'welcome' || m.t === 'error') { done(m); ws.close() } });
+      });
+    };
+    expect(await tryBind('bob')).toMatchObject({ t: 'error', code: 'pass', msg: 'That wallet is not linked to your account.' });
+    privyUsers.set(uid, { id: uid, linked_accounts: [{ type: 'wallet', chain_type: 'ethereum', address: acct.bob.address }] });
+    expect(await tryBind('bob')).toMatchObject({ t: 'welcome', name: 'Binder', pass: { id: '1', attempt: 2 } });
   }, 60_000);
 
   it('the browser RPC proxy forwards reads only', async () => {
